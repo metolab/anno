@@ -1,0 +1,216 @@
+{
+  "concurrent": {
+    "concurrent": {
+      "client_rss_mb": 7.51171875,
+      "dial_latency_us": {
+        "max": 14855,
+        "p50": 10575,
+        "p95": 14799,
+        "p99": 14831
+      },
+      "established": 200,
+      "requested": 200,
+      "server_rss_mb": 7.02734375
+    }
+  },
+  "latency": {
+    "latency": {
+      "jitter_us": 16,
+      "max_us": 254,
+      "p50_us": 87,
+      "p95_us": 103,
+      "p999_us": 179,
+      "p99_us": 121,
+      "payload_size": 256,
+      "samples": 3000
+    }
+  },
+  "memory": {
+    "memory": {
+      "client": {
+        "final_mb": 7.51171875,
+        "growth_mb": 0.0,
+        "initial_mb": 7.51171875,
+        "leak_detected": false,
+        "peak_mb": 7.51171875
+      },
+      "duration_secs": 25.0,
+      "samples": [
+        {
+          "client_rss_mb": 7.51171875,
+          "server_rss_mb": 7.02734375,
+          "t_secs": 0.000778265
+        },
+        {
+          "client_rss_mb": 7.51171875,
+          "server_rss_mb": 7.02734375,
+          "t_secs": 5.002709762
+        },
+        {
+          "client_rss_mb": 7.51171875,
+          "server_rss_mb": 7.02734375,
+          "t_secs": 10.004543451
+        },
+        {
+          "client_rss_mb": 7.51171875,
+          "server_rss_mb": 7.02734375,
+          "t_secs": 15.005533498
+        },
+        {
+          "client_rss_mb": 7.51171875,
+          "server_rss_mb": 7.02734375,
+          "t_secs": 20.007315999
+        }
+      ],
+      "server": {
+        "final_mb": 7.02734375,
+        "growth_mb": 0.0,
+        "initial_mb": 7.02734375,
+        "leak_detected": false,
+        "peak_mb": 7.02734375
+      }
+    }
+  },
+  "tcp_throughput_suite": {
+    "client_rss_mb": 6.98046875,
+    "server_rss_mb": 6.6796875,
+    "tcp_throughput": [
+      {
+        "connections": 1,
+        "duration_secs": 8.0,
+        "errors": 0,
+        "latency_us": {
+          "max": 1642,
+          "p50": 89,
+          "p95": 117,
+          "p99": 138,
+          "p999": 214
+        },
+        "payload_size": 64,
+        "rps": 10778.978109475813,
+        "throughput_mbps": 11.037673584103233,
+        "total_bytes": 11037824
+      },
+      {
+        "connections": 10,
+        "duration_secs": 8.0,
+        "errors": 0,
+        "latency_us": {
+          "max": 2941,
+          "p50": 150,
+          "p95": 224,
+          "p99": 266,
+          "p999": 446
+        },
+        "payload_size": 64,
+        "rps": 63921.56914650292,
+        "throughput_mbps": 65.45568680601899,
+        "total_bytes": 65457792
+      },
+      {
+        "connections": 1,
+        "duration_secs": 8.0,
+        "errors": 0,
+        "latency_us": {
+          "max": 2409,
+          "p50": 89,
+          "p95": 122,
+          "p99": 143,
+          "p999": 230
+        },
+        "payload_size": 1024,
+        "rps": 10631.502458644785,
+        "throughput_mbps": 174.18653628243618,
+        "total_bytes": 174188544
+      },
+      {
+        "connections": 10,
+        "duration_secs": 8.0,
+        "errors": 0,
+        "latency_us": {
+          "max": 41183,
+          "p50": 151,
+          "p95": 228,
+          "p99": 272,
+          "p999": 423
+        },
+        "payload_size": 1024,
+        "rps": 63152.20609084205,
+        "throughput_mbps": 1034.6857445923563,
+        "total_bytes": 1034723328
+      },
+      {
+        "connections": 1,
+        "duration_secs": 8.0,
+        "errors": 0,
+        "latency_us": {
+          "max": 1655,
+          "p50": 86,
+          "p95": 117,
+          "p99": 137,
+          "p999": 209
+        },
+        "payload_size": 8192,
+        "rps": 10985.148811674864,
+        "throughput_mbps": 1439.8454250438479,
+        "total_bytes": 1439858688
+      },
+      {
+        "connections": 10,
+        "duration_secs": 8.0,
+        "errors": 0,
+        "latency_us": {
+          "max": 82175,
+          "p50": 162,
+          "p95": 241,
+          "p99": 286,
+          "p999": 468
+        },
+        "payload_size": 8192,
+        "rps": 55422.16637148114,
+        "throughput_mbps": 7264.294190642776,
+        "total_bytes": 7264534528
+      }
+    ]
+  },
+  "udp_throughput_suite": {
+    "client_rss_mb": 6.98046875,
+    "server_rss_mb": 6.6796875,
+    "udp_throughput": [
+      {
+        "duration_secs": 8.0,
+        "latency_us": {
+          "max": 2115,
+          "p50": 91,
+          "p95": 123,
+          "p99": 146,
+          "p999": 244
+        },
+        "loss_rate": 0.0,
+        "packet_size": 64,
+        "packets_lost": 0,
+        "packets_ok": 82963,
+        "packets_sent": 82963,
+        "pps": 10370.375,
+        "throughput_mbps": 5.309632
+      },
+      {
+        "duration_secs": 8.0,
+        "latency_us": {
+          "max": 1768,
+          "p50": 90,
+          "p95": 115,
+          "p99": 137,
+          "p999": 220
+        },
+        "loss_rate": 0.0,
+        "packet_size": 1024,
+        "packets_lost": 0,
+        "packets_ok": 85179,
+        "packets_sent": 85179,
+        "pps": 10647.375,
+        "throughput_mbps": 87.223296
+      }
+    ]
+  }
+}

@@ -1,0 +1,633 @@
+{
+  "client_rss_mb": 7.88671875,
+  "server_rss_mb": 6.546875,
+  "suite_meta": {
+    "collect_resources": true,
+    "logical_cpus": 32,
+    "resource_sample_interval_secs": 2,
+    "target_mbps": 100.0
+  },
+  "tcp_throughput": [
+    {
+      "connections": 1,
+      "cpu": {
+        "client": {
+          "avg_core_usage_estimate": 0.7525984621537153,
+          "avg_percent_of_machine": 2.35187019423036,
+          "logical_cpus": 32,
+          "user_sys_seconds": 7.53
+        },
+        "server": {
+          "avg_core_usage_estimate": 0.5487072453152586,
+          "avg_percent_of_machine": 1.714710141610183,
+          "logical_cpus": 32,
+          "user_sys_seconds": 5.49
+        }
+      },
+      "duration_secs": 10.0,
+      "errors": 0,
+      "latency_us": {
+        "max": 1865,
+        "p50": 81,
+        "p95": 109,
+        "p99": 131,
+        "p999": 210
+      },
+      "payload_size": 64,
+      "rate_limit_bytes_per_sec": 12500000,
+      "rps": 11740.294814002644,
+      "rss_mb_after_case": {
+        "client": 3.75,
+        "server": 4.01953125
+      },
+      "rss_timeline_summary": {
+        "client_rss_mb_avg": 3.75,
+        "client_rss_mb_max": 3.75,
+        "samples": [
+          {
+            "client_rss_mb": 3.75,
+            "server_rss_mb": 4.01953125,
+            "t_secs": 1.3e-7
+          },
+          {
+            "client_rss_mb": 3.75,
+            "server_rss_mb": 4.01953125,
+            "t_secs": 2.00103476
+          },
+          {
+            "client_rss_mb": 3.75,
+            "server_rss_mb": 4.01953125,
+            "t_secs": 4.002028829
+          },
+          {
+            "client_rss_mb": 3.75,
+            "server_rss_mb": 4.01953125,
+            "t_secs": 6.003012039
+          },
+          {
+            "client_rss_mb": 3.75,
+            "server_rss_mb": 4.01953125,
+            "t_secs": 8.004038059
+          }
+        ],
+        "server_rss_mb_avg": 4.01953125,
+        "server_rss_mb_max": 4.01953125
+      },
+      "target_mbps": 100.0,
+      "throughput_mbps": 12.022061889538707,
+      "total_bytes": 15027712
+    },
+    {
+      "connections": 5,
+      "cpu": {
+        "client": {
+          "avg_core_usage_estimate": 1.7010778712021892,
+          "avg_percent_of_machine": 5.315868347506841,
+          "logical_cpus": 32,
+          "user_sys_seconds": 17.02
+        },
+        "server": {
+          "avg_core_usage_estimate": 1.4392198205235915,
+          "avg_percent_of_machine": 4.497561939136223,
+          "logical_cpus": 32,
+          "user_sys_seconds": 14.4
+        }
+      },
+      "duration_secs": 10.0,
+      "errors": 0,
+      "latency_us": {
+        "max": 3729,
+        "p50": 104,
+        "p95": 155,
+        "p99": 188,
+        "p999": 302
+      },
+      "payload_size": 64,
+      "rate_limit_bytes_per_sec": 12500000,
+      "rps": 45864.363026553416,
+      "rss_mb_after_case": {
+        "client": 4.83203125,
+        "server": 5.11328125
+      },
+      "rss_timeline_summary": {
+        "client_rss_mb_avg": 4.5015625,
+        "client_rss_mb_max": 4.82421875,
+        "samples": [
+          {
+            "client_rss_mb": 3.75,
+            "server_rss_mb": 4.01953125,
+            "t_secs": 4e-7
+          },
+          {
+            "client_rss_mb": 4.421875,
+            "server_rss_mb": 5.171875,
+            "t_secs": 2.000889462
+          },
+          {
+            "client_rss_mb": 4.77734375,
+            "server_rss_mb": 5.2734375,
+            "t_secs": 4.001884292
+          },
+          {
+            "client_rss_mb": 4.82421875,
+            "server_rss_mb": 5.0859375,
+            "t_secs": 6.002885072
+          },
+          {
+            "client_rss_mb": 4.734375,
+            "server_rss_mb": 5.125,
+            "t_secs": 8.003880913
+          }
+        ],
+        "server_rss_mb_avg": 4.93515625,
+        "server_rss_mb_max": 5.2734375
+      },
+      "target_mbps": 100.0,
+      "throughput_mbps": 46.9651077391907,
+      "total_bytes": 58707200
+    },
+    {
+      "connections": 10,
+      "cpu": {
+        "client": {
+          "avg_core_usage_estimate": 0.8475256884354047,
+          "avg_percent_of_machine": 2.6485177763606393,
+          "logical_cpus": 32,
+          "user_sys_seconds": 8.48
+        },
+        "server": {
+          "avg_core_usage_estimate": 0.7365877740293552,
+          "avg_percent_of_machine": 2.301836793841735,
+          "logical_cpus": 32,
+          "user_sys_seconds": 7.37
+        }
+      },
+      "duration_secs": 10.0,
+      "errors": 0,
+      "latency_us": {
+        "max": 2739,
+        "p50": 142,
+        "p95": 1203,
+        "p99": 1243,
+        "p999": 1284
+      },
+      "payload_size": 64,
+      "rate_limit_bytes_per_sec": 12500000,
+      "rps": 28114.87693055486,
+      "rss_mb_after_case": {
+        "client": 5.4765625,
+        "server": 5.83984375
+      },
+      "rss_timeline_summary": {
+        "client_rss_mb_avg": 5.209375,
+        "client_rss_mb_max": 5.59375,
+        "samples": [
+          {
+            "client_rss_mb": 4.83203125,
+            "server_rss_mb": 5.11328125,
+            "t_secs": 1.11e-7
+          },
+          {
+            "client_rss_mb": 4.734375,
+            "server_rss_mb": 5.34765625,
+            "t_secs": 2.000980141
+          },
+          {
+            "client_rss_mb": 5.59375,
+            "server_rss_mb": 5.7890625,
+            "t_secs": 4.00198316
+          },
+          {
+            "client_rss_mb": 5.48046875,
+            "server_rss_mb": 5.640625,
+            "t_secs": 6.00298214
+          },
+          {
+            "client_rss_mb": 5.40625,
+            "server_rss_mb": 5.890625,
+            "t_secs": 8.003978981
+          }
+        ],
+        "server_rss_mb_avg": 5.55625,
+        "server_rss_mb_max": 5.890625
+      },
+      "target_mbps": 100.0,
+      "throughput_mbps": 28.789633976888176,
+      "total_bytes": 35988352
+    },
+    {
+      "connections": 1,
+      "cpu": {
+        "client": {
+          "avg_core_usage_estimate": 0.05997252941497838,
+          "avg_percent_of_machine": 0.18741415442180745,
+          "logical_cpus": 32,
+          "user_sys_seconds": 0.6
+        },
+        "server": {
+          "avg_core_usage_estimate": 0.04497939706123379,
+          "avg_percent_of_machine": 0.1405606158163556,
+          "logical_cpus": 32,
+          "user_sys_seconds": 0.45
+        }
+      },
+      "duration_secs": 10.0,
+      "errors": 0,
+      "latency_us": {
+        "max": 640,
+        "p50": 92,
+        "p95": 136,
+        "p99": 188,
+        "p999": 264
+      },
+      "payload_size": 1024,
+      "rate_limit_bytes_per_sec": 12500000,
+      "rps": 837.5746290269121,
+      "rss_mb_after_case": {
+        "client": 5.4765625,
+        "server": 5.83984375
+      },
+      "rss_timeline_summary": {
+        "client_rss_mb_avg": 5.4765625,
+        "client_rss_mb_max": 5.4765625,
+        "samples": [
+          {
+            "client_rss_mb": 5.4765625,
+            "server_rss_mb": 5.83984375,
+            "t_secs": 1.6e-7
+          },
+          {
+            "client_rss_mb": 5.4765625,
+            "server_rss_mb": 5.83984375,
+            "t_secs": 2.000339452
+          },
+          {
+            "client_rss_mb": 5.4765625,
+            "server_rss_mb": 5.83984375,
+            "t_secs": 4.001921771
+          },
+          {
+            "client_rss_mb": 5.4765625,
+            "server_rss_mb": 5.83984375,
+            "t_secs": 6.002393021
+          },
+          {
+            "client_rss_mb": 5.4765625,
+            "server_rss_mb": 5.83984375,
+            "t_secs": 8.004071378
+          }
+        ],
+        "server_rss_mb_avg": 5.83984375,
+        "server_rss_mb_max": 5.83984375
+      },
+      "target_mbps": 100.0,
+      "throughput_mbps": 13.722822721976929,
+      "total_bytes": 17154048
+    },
+    {
+      "connections": 5,
+      "cpu": {
+        "client": {
+          "avg_core_usage_estimate": 0.11193859217860358,
+          "avg_percent_of_machine": 0.34980810055813616,
+          "logical_cpus": 32,
+          "user_sys_seconds": 1.12
+        },
+        "server": {
+          "avg_core_usage_estimate": 0.09394846129275657,
+          "avg_percent_of_machine": 0.29358894153986426,
+          "logical_cpus": 32,
+          "user_sys_seconds": 0.94
+        }
+      },
+      "duration_secs": 10.0,
+      "errors": 0,
+      "latency_us": {
+        "max": 3603,
+        "p50": 1174,
+        "p95": 2255,
+        "p99": 2309,
+        "p999": 2393
+      },
+      "payload_size": 1024,
+      "rate_limit_bytes_per_sec": 12500000,
+      "rps": 2672.263261960155,
+      "rss_mb_after_case": {
+        "client": 6.03515625,
+        "server": 5.59765625
+      },
+      "rss_timeline_summary": {
+        "client_rss_mb_avg": 5.90859375,
+        "client_rss_mb_max": 6.16796875,
+        "samples": [
+          {
+            "client_rss_mb": 5.4765625,
+            "server_rss_mb": 5.83984375,
+            "t_secs": 1.2e-7
+          },
+          {
+            "client_rss_mb": 6.16796875,
+            "server_rss_mb": 5.9296875,
+            "t_secs": 2.001565939
+          },
+          {
+            "client_rss_mb": 5.96484375,
+            "server_rss_mb": 5.69921875,
+            "t_secs": 4.002264945
+          },
+          {
+            "client_rss_mb": 5.94140625,
+            "server_rss_mb": 5.52734375,
+            "t_secs": 6.003481401
+          },
+          {
+            "client_rss_mb": 5.9921875,
+            "server_rss_mb": 5.8515625,
+            "t_secs": 8.004771665
+          }
+        ],
+        "server_rss_mb_avg": 5.76953125,
+        "server_rss_mb_max": 5.9296875
+      },
+      "target_mbps": 100.0,
+      "throughput_mbps": 43.78236128395518,
+      "total_bytes": 54734848
+    },
+    {
+      "connections": 10,
+      "cpu": {
+        "client": {
+          "avg_core_usage_estimate": 0.11292641816226323,
+          "avg_percent_of_machine": 0.3528950567570726,
+          "logical_cpus": 32,
+          "user_sys_seconds": 1.13
+        },
+        "server": {
+          "avg_core_usage_estimate": 0.09893553449614213,
+          "avg_percent_of_machine": 0.30917354530044416,
+          "logical_cpus": 32,
+          "user_sys_seconds": 0.99
+        }
+      },
+      "duration_secs": 10.0,
+      "errors": 0,
+      "latency_us": {
+        "max": 3833,
+        "p50": 2253,
+        "p95": 3299,
+        "p99": 3363,
+        "p999": 3471
+      },
+      "payload_size": 1024,
+      "rate_limit_bytes_per_sec": 12500000,
+      "rps": 3699.2646501830927,
+      "rss_mb_after_case": {
+        "client": 6.6640625,
+        "server": 5.98828125
+      },
+      "rss_timeline_summary": {
+        "client_rss_mb_avg": 6.490625,
+        "client_rss_mb_max": 6.75,
+        "samples": [
+          {
+            "client_rss_mb": 6.03515625,
+            "server_rss_mb": 5.59765625,
+            "t_secs": 1.4e-7
+          },
+          {
+            "client_rss_mb": 6.6328125,
+            "server_rss_mb": 5.9375,
+            "t_secs": 2.001701216
+          },
+          {
+            "client_rss_mb": 6.52734375,
+            "server_rss_mb": 6.01953125,
+            "t_secs": 4.003560709
+          },
+          {
+            "client_rss_mb": 6.5078125,
+            "server_rss_mb": 5.9921875,
+            "t_secs": 6.004613118
+          },
+          {
+            "client_rss_mb": 6.75,
+            "server_rss_mb": 6.1484375,
+            "t_secs": 8.004805183
+          }
+        ],
+        "server_rss_mb_avg": 5.9390625,
+        "server_rss_mb_max": 6.1484375
+      },
+      "target_mbps": 100.0,
+      "throughput_mbps": 60.608752028599795,
+      "total_bytes": 75778048
+    },
+    {
+      "connections": 1,
+      "cpu": {
+        "client": {
+          "avg_core_usage_estimate": 0.04496755462326726,
+          "avg_percent_of_machine": 0.14052360819771018,
+          "logical_cpus": 32,
+          "user_sys_seconds": 0.45
+        },
+        "server": {
+          "avg_core_usage_estimate": 0.03497476470698564,
+          "avg_percent_of_machine": 0.10929613970933014,
+          "logical_cpus": 32,
+          "user_sys_seconds": 0.35
+        }
+      },
+      "duration_secs": 10.0,
+      "errors": 0,
+      "latency_us": {
+        "max": 1425,
+        "p50": 110,
+        "p95": 156,
+        "p99": 216,
+        "p999": 378
+      },
+      "payload_size": 4096,
+      "rate_limit_bytes_per_sec": 12500000,
+      "rps": 585.7425101926641,
+      "rss_mb_after_case": {
+        "client": 6.90625,
+        "server": 5.8671875
+      },
+      "rss_timeline_summary": {
+        "client_rss_mb_avg": 6.82734375,
+        "client_rss_mb_max": 6.921875,
+        "samples": [
+          {
+            "client_rss_mb": 6.6640625,
+            "server_rss_mb": 5.98828125,
+            "t_secs": 2.3e-7
+          },
+          {
+            "client_rss_mb": 6.82421875,
+            "server_rss_mb": 5.96484375,
+            "t_secs": 2.0014851
+          },
+          {
+            "client_rss_mb": 6.8046875,
+            "server_rss_mb": 5.94921875,
+            "t_secs": 4.003281865
+          },
+          {
+            "client_rss_mb": 6.921875,
+            "server_rss_mb": 5.91796875,
+            "t_secs": 6.004562279
+          },
+          {
+            "client_rss_mb": 6.921875,
+            "server_rss_mb": 5.87109375,
+            "t_secs": 8.006312235
+          }
+        ],
+        "server_rss_mb_avg": 5.93828125,
+        "server_rss_mb_max": 5.98828125
+      },
+      "target_mbps": 100.0,
+      "throughput_mbps": 38.38722114798643,
+      "total_bytes": 47988736
+    },
+    {
+      "connections": 5,
+      "cpu": {
+        "client": {
+          "avg_core_usage_estimate": 0.05597282724657455,
+          "avg_percent_of_machine": 0.17491508514554546,
+          "logical_cpus": 32,
+          "user_sys_seconds": 0.56
+        },
+        "server": {
+          "avg_core_usage_estimate": 0.04797670906849246,
+          "avg_percent_of_machine": 0.14992721583903895,
+          "logical_cpus": 32,
+          "user_sys_seconds": 0.48
+        }
+      },
+      "duration_secs": 10.0,
+      "errors": 0,
+      "latency_us": {
+        "max": 5451,
+        "p50": 2185,
+        "p95": 4427,
+        "p99": 5279,
+        "p999": 5367
+      },
+      "payload_size": 4096,
+      "rate_limit_bytes_per_sec": 12500000,
+      "rps": 1152.8983100313903,
+      "rss_mb_after_case": {
+        "client": 7.203125,
+        "server": 6.28515625
+      },
+      "rss_timeline_summary": {
+        "client_rss_mb_avg": 7.24375,
+        "client_rss_mb_max": 7.34375,
+        "samples": [
+          {
+            "client_rss_mb": 6.90625,
+            "server_rss_mb": 5.8671875,
+            "t_secs": 2.7e-7
+          },
+          {
+            "client_rss_mb": 7.33984375,
+            "server_rss_mb": 6.33203125,
+            "t_secs": 2.001054679
+          },
+          {
+            "client_rss_mb": 7.3046875,
+            "server_rss_mb": 6.2265625,
+            "t_secs": 4.001683826
+          },
+          {
+            "client_rss_mb": 7.32421875,
+            "server_rss_mb": 6.32421875,
+            "t_secs": 6.002679366
+          },
+          {
+            "client_rss_mb": 7.34375,
+            "server_rss_mb": 6.4609375,
+            "t_secs": 8.004055658
+          }
+        ],
+        "server_rss_mb_avg": 6.2421875,
+        "server_rss_mb_max": 6.4609375
+      },
+      "target_mbps": 100.0,
+      "throughput_mbps": 75.5563436462172,
+      "total_bytes": 94470144
+    },
+    {
+      "connections": 10,
+      "cpu": {
+        "client": {
+          "avg_core_usage_estimate": 0.050955360378196916,
+          "avg_percent_of_machine": 0.15923550118186536,
+          "logical_cpus": 32,
+          "user_sys_seconds": 0.51
+        },
+        "server": {
+          "avg_core_usage_estimate": 0.04496061209840905,
+          "avg_percent_of_machine": 0.14050191280752827,
+          "logical_cpus": 32,
+          "user_sys_seconds": 0.45
+        }
+      },
+      "duration_secs": 10.0,
+      "errors": 0,
+      "latency_us": {
+        "max": 8919,
+        "p50": 6263,
+        "p95": 8327,
+        "p99": 8407,
+        "p999": 8495
+      },
+      "payload_size": 4096,
+      "rate_limit_bytes_per_sec": 12500000,
+      "rps": 1311.2906268867457,
+      "rss_mb_after_case": {
+        "client": 7.88671875,
+        "server": 6.546875
+      },
+      "rss_timeline_summary": {
+        "client_rss_mb_avg": 7.48359375,
+        "client_rss_mb_max": 7.81640625,
+        "samples": [
+          {
+            "client_rss_mb": 7.203125,
+            "server_rss_mb": 6.28515625,
+            "t_secs": 2.2e-7
+          },
+          {
+            "client_rss_mb": 7.36328125,
+            "server_rss_mb": 6.60546875,
+            "t_secs": 2.001304784
+          },
+          {
+            "client_rss_mb": 7.71875,
+            "server_rss_mb": 6.59375,
+            "t_secs": 4.002358452
+          },
+          {
+            "client_rss_mb": 7.31640625,
+            "server_rss_mb": 6.80859375,
+            "t_secs": 6.003041139
+          },
+          {
+            "client_rss_mb": 7.81640625,
+            "server_rss_mb": 6.44140625,
+            "t_secs": 8.004476001
+          }
+        ],
+        "server_rss_mb_avg": 6.546875,
+        "server_rss_mb_max": 6.80859375
+      },
+      "target_mbps": 100.0,
+      "throughput_mbps": 85.93674252364976,
+      "total_bytes": 107511808
+    }
+  ]
+}

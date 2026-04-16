@@ -1,0 +1,21 @@
+[package]
+name = "anno-client"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "anno-client"
+path = "src/main.rs"
+
+[dependencies]
+anno-common = { path = "../common" }
+tokio = { version = "1.36", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+bytes = "1.5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "1.0"
+httparse = "1.8"
+dashmap = "5.5"
+futures = "0.3"
+clap = { version = "4.5", features = ["derive"] }

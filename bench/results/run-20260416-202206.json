@@ -1,0 +1,5 @@
+error: unexpected argument '--output' found
+
+Usage: anno-bench all --tcp-duration <TCP_DURATION> --tcp-connections <TCP_CONNECTIONS> --tcp-payloads <TCP_PAYLOADS> --udp-duration <UDP_DURATION> --udp-packets <UDP_PACKETS> --latency-samples <LATENCY_SAMPLES> --latency-payload <LATENCY_PAYLOAD> --concurrent-max <CONCURRENT_MAX> --memory-duration <MEMORY_DURATION> --memory-sample-interval-secs <MEMORY_SAMPLE_INTERVAL_SECS>
+
+For more information, try '--help'.
