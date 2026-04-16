@@ -1,5 +1,6 @@
 //! HTTP management API with structured error handling and security middleware.
 
+use crate::frontend::static_handler;
 use crate::proxy;
 use crate::registry::ClientEntry;
 use crate::state::{stored_to_port_mapping, AppState, StoredMapping};
@@ -241,6 +242,7 @@ pub fn router(state: AppState, metrics_handle: PrometheusHandle) -> Router {
         .merge(login_route)
         .merge(api_routes)
         .merge(metrics_route)
+        .fallback(static_handler)
         .layer(TimeoutLayer::new(Duration::from_secs(30)))
         .layer(
             CorsLayer::new()

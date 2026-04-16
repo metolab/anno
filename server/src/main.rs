@@ -1,5 +1,6 @@
 mod api;
 mod control;
+mod frontend;
 mod proxy;
 mod registry;
 mod session;

@@ -29,3 +29,5 @@ metrics-exporter-prometheus = "0.18.1"
 bcrypt = "0.15"
 dotenvy = "0.15"
 uuid = { version = "1.8", features = ["v4"] }
+rust-embed = { version = "8", features = ["mime-guess"] }
+mime_guess = "2.0"
