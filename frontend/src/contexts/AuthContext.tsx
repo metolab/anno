@@ -1,5 +1,5 @@
 import React, { createContext, useCallback, useContext, useEffect, useState } from "react";
-import { api } from "../api/client";
+import { api } from "../api";
 
 const TOKEN_KEY = "anno_auth_token";
 

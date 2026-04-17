@@ -35,6 +35,12 @@ pub struct StatsDto {
     pub sessions_active: usize,
     pub sessions_tcp: usize,
     pub sessions_udp: usize,
+    #[serde(default)]
+    pub queue_drops_total: u64,
+    #[serde(default)]
+    pub bytes_up_total: u64,
+    #[serde(default)]
+    pub bytes_down_total: u64,
 }
 
 #[derive(Debug, Serialize)]

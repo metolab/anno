@@ -1,6 +1,6 @@
 import { Card, Col, Row, Statistic, Typography } from "antd";
 import { useEffect, useState } from "react";
-import { fetchStats, StatsDto } from "../api/client";
+import { fetchStats, StatsDto } from "../api";
 
 export default function DashboardPage() {
   const [stats, setStats] = useState<StatsDto | null>(null);

@@ -1,4 +1,12 @@
 //! Fixed 16-byte header + payload frames (big-endian).
+//!
+//! This module only defines the low-level wire format:
+//! - Frame header / magic / version / message type codes
+//! - Enumerations shared with the high-level `message` module
+//! - Binary encoding of addresses (used by several message types)
+//!
+//! All payload-level helpers live in the [`crate::message`] module and are
+//! built around the `Message` trait.
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -7,7 +15,7 @@ use tokio_util::codec::{Decoder, Encoder};
 
 pub const FRAME_HEADER_SIZE: usize = 16;
 pub const MAGIC: u16 = 0x4E54;
-pub const VERSION: u8 = 0x01;
+pub const VERSION: u8 = 0x02;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -49,12 +57,23 @@ impl TryFrom<u8> for MessageType {
     }
 }
 
+/// Protocol selector for port mappings (config layer).
+///
+/// `Both` means "listen on TCP AND UDP for this server port"; it is only
+/// meaningful inside [`PortMapping`] / `ConfigPush`. Per-connection frames
+/// (e.g. `NewConn`) use [`ConnProtocol`] which is strictly `Tcp` or `Udp`.
+///
+/// `HttpProxy` is a TCP listener whose per-connection target is resolved
+/// server-side to `127.0.0.1:<client's registered http_proxy_port>`, so
+/// a client that restarts with a different random proxy port keeps
+/// working transparently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Protocol {
     Tcp = 0x00,
     Udp = 0x01,
     Both = 0x02,
+    HttpProxy = 0x03,
 }
 
 impl TryFrom<u8> for Protocol {
@@ -65,7 +84,40 @@ impl TryFrom<u8> for Protocol {
             0x00 => Ok(Self::Tcp),
             0x01 => Ok(Self::Udp),
             0x02 => Ok(Self::Both),
+            0x03 => Ok(Self::HttpProxy),
             _ => Err(()),
+        }
+    }
+}
+
+/// Connection-level protocol (no `Both`) used on the wire for `NewConn`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ConnProtocol {
+    Tcp = 0x00,
+    Udp = 0x01,
+}
+
+impl TryFrom<u8> for ConnProtocol {
+    type Error = ();
+
+    fn try_from(v: u8) -> Result<Self, Self::Error> {
+        match v {
+            0x00 => Ok(Self::Tcp),
+            0x01 => Ok(Self::Udp),
+            // Explicitly reject 0x02 (Both) — it is not a valid per-connection
+            // protocol; accepting it would lead to silent warn-and-drop on the
+            // client side.
+            _ => Err(()),
+        }
+    }
+}
+
+impl From<ConnProtocol> for Protocol {
+    fn from(p: ConnProtocol) -> Self {
+        match p {
+            ConnProtocol::Tcp => Protocol::Tcp,
+            ConnProtocol::Udp => Protocol::Udp,
         }
     }
 }
@@ -117,10 +169,15 @@ impl TargetAddress {
             }
             Host::Domain(s) => {
                 let b = s.as_bytes();
-                assert!(b.len() <= 255, "domain too long");
+                // Domain is length-prefixed by a single byte: truncate on the
+                // wire rather than panic. Callers (e.g. the HTTP API layer)
+                // should validate the length before it ever reaches here.
+                debug_assert!(b.len() <= 255, "domain too long: {} bytes", b.len());
+                debug_assert!(!b.is_empty(), "domain must not be empty");
+                let len = b.len().min(255);
                 buf.put_u8(AddressType::Domain as u8);
-                buf.put_u8(b.len() as u8);
-                buf.put_slice(b);
+                buf.put_u8(len as u8);
+                buf.put_slice(&b[..len]);
                 buf.put_u16(self.port);
             }
         }
@@ -171,6 +228,11 @@ impl TargetAddress {
                     return Err(ProtocolError::Truncated);
                 }
                 let len = src[0] as usize;
+                if len == 0 {
+                    // Reject empty domains at the protocol boundary so we
+                    // never hand an empty string to DNS downstream.
+                    return Err(ProtocolError::EmptyDomain);
+                }
                 if src.len() < 1 + len + 2 {
                     return Err(ProtocolError::Truncated);
                 }
@@ -214,22 +276,38 @@ pub enum ProtocolError {
     PayloadTooLarge,
     #[error("invalid utf8")]
     InvalidUtf8,
+    #[error("invalid register payload")]
+    InvalidRegisterPayload,
     #[error("bad address type {0}")]
     BadAddressType(u8),
+    #[error("empty domain name")]
+    EmptyDomain,
+    #[error("bad connection protocol {0}")]
+    BadConnProtocol(u8),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
 
 pub fn encode_frame(f: &Frame) -> BytesMut {
-    let mut buf = BytesMut::with_capacity(FRAME_HEADER_SIZE + f.payload.len());
+    // The wire format uses a 2-byte payload length. Callers must cap their
+    // reads/payloads to <= 65535. This guard catches regressions in debug;
+    // in release we clamp to u16::MAX so we never silently wrap to 0 and
+    // corrupt the stream for the peer.
+    debug_assert!(
+        f.payload.len() <= u16::MAX as usize,
+        "frame payload too large: {} bytes",
+        f.payload.len()
+    );
+    let payload_len = f.payload.len().min(u16::MAX as usize);
+    let mut buf = BytesMut::with_capacity(FRAME_HEADER_SIZE + payload_len);
     buf.put_u16(MAGIC);
     buf.put_u8(VERSION);
     buf.put_u8(f.msg_type as u8);
     buf.put_u8(f.flags);
     buf.put_u8(0);
-    buf.put_u16(f.payload.len() as u16);
+    buf.put_u16(payload_len as u16);
     buf.put_u64(f.conn_id);
-    buf.extend_from_slice(&f.payload);
+    buf.extend_from_slice(&f.payload[..payload_len]);
     buf
 }
 
@@ -289,268 +367,13 @@ impl Encoder<Frame> for FrameCodec {
     }
 }
 
-// --- Payload helpers ---
-
-pub fn build_register(name: &str, key: Option<&str>, http_proxy_port: Option<u16>) -> Frame {
-    let mut p = BytesMut::new();
-    let b = name.as_bytes();
-    p.put_u16(b.len() as u16);
-    p.extend_from_slice(b);
-    let hp = http_proxy_port.filter(|p| *p > 0).unwrap_or(0);
-    p.put_u16(hp);
-    let key_bytes = key.unwrap_or("").as_bytes();
-    p.put_u16(key_bytes.len() as u16);
-    p.extend_from_slice(key_bytes);
-    Frame {
-        msg_type: MessageType::Register,
-        flags: 0,
-        conn_id: 0,
-        payload: p.freeze(),
-    }
-}
-
-/// Returns client name, optional local HTTP proxy port, and optional key.
-pub fn parse_register(
-    payload: &[u8],
-) -> Result<(String, Option<u16>, Option<String>), ProtocolError> {
-    if payload.len() < 2 {
-        return Err(ProtocolError::Truncated);
-    }
-    let n = u16::from_be_bytes([payload[0], payload[1]]) as usize;
-    if payload.len() < 2 + n {
-        return Err(ProtocolError::Truncated);
-    }
-    let name = std::str::from_utf8(&payload[2..2 + n])
-        .map_err(|_| ProtocolError::InvalidUtf8)?
-        .to_string();
-    let mut offset = 2 + n;
-    let mut http_proxy = None;
-    if payload.len() >= offset + 2 {
-        let hp = u16::from_be_bytes([payload[offset], payload[offset + 1]]);
-        offset += 2;
-        if hp != 0 {
-            http_proxy = Some(hp);
-        }
-    }
-    let mut key = None;
-    if payload.len() >= offset + 2 {
-        let key_len = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
-        offset += 2;
-        if payload.len() >= offset + key_len && key_len > 0 {
-            let s = std::str::from_utf8(&payload[offset..offset + key_len])
-                .map_err(|_| ProtocolError::InvalidUtf8)?
-                .to_string();
-            key = Some(s);
-        }
-    }
-    Ok((name, http_proxy, key))
-}
-
-pub fn build_register_ack(client_id: u64) -> Frame {
-    let mut p = BytesMut::with_capacity(8);
-    p.put_u64(client_id);
-    Frame {
-        msg_type: MessageType::RegisterAck,
-        flags: 0,
-        conn_id: 0,
-        payload: p.freeze(),
-    }
-}
-
-pub fn parse_register_ack(payload: &[u8]) -> Result<u64, ProtocolError> {
-    if payload.len() < 8 {
-        return Err(ProtocolError::Truncated);
-    }
-    Ok(u64::from_be_bytes([
-        payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6],
-        payload[7],
-    ]))
-}
-
+/// Port mapping definition (config layer): which server port forwards to
+/// which target over which protocol.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortMapping {
     pub server_port: u16,
     pub protocol: Protocol,
     pub target: TargetAddress,
-}
-
-pub fn build_config_push(mappings: &[PortMapping]) -> Frame {
-    let mut p = BytesMut::new();
-    p.put_u16(mappings.len() as u16);
-    for m in mappings {
-        p.put_u8(m.protocol as u8);
-        p.put_u16(m.server_port);
-        m.target.encode(&mut p);
-    }
-    Frame {
-        msg_type: MessageType::ConfigPush,
-        flags: 0,
-        conn_id: 0,
-        payload: p.freeze(),
-    }
-}
-
-pub fn parse_config_push(payload: &[u8]) -> Result<Vec<PortMapping>, ProtocolError> {
-    if payload.len() < 2 {
-        return Err(ProtocolError::Truncated);
-    }
-    let count = u16::from_be_bytes([payload[0], payload[1]]) as usize;
-    let mut out = Vec::with_capacity(count);
-    let mut i = 2usize;
-    for _ in 0..count {
-        if i >= payload.len() {
-            return Err(ProtocolError::Truncated);
-        }
-        let proto = Protocol::try_from(payload[i])
-            .map_err(|_| ProtocolError::BadMessageType(payload[i]))?;
-        i += 1;
-        if i + 2 > payload.len() {
-            return Err(ProtocolError::Truncated);
-        }
-        let server_port = u16::from_be_bytes([payload[i], payload[i + 1]]);
-        i += 2;
-        let rest = &payload[i..];
-        let (target, c) = TargetAddress::decode(rest)?;
-        i += c;
-        out.push(PortMapping {
-            server_port,
-            protocol: proto,
-            target,
-        });
-    }
-    Ok(out)
-}
-
-pub fn build_new_conn(
-    conn_id: u64,
-    server_port: u16,
-    protocol: Protocol,
-    target: &TargetAddress,
-) -> Frame {
-    let mut p = BytesMut::new();
-    p.put_u16(server_port);
-    p.put_u8(protocol as u8);
-    target.encode(&mut p);
-    Frame {
-        msg_type: MessageType::NewConn,
-        flags: 0,
-        conn_id,
-        payload: p.freeze(),
-    }
-}
-
-pub fn parse_new_conn(payload: &[u8]) -> Result<(u16, Protocol, TargetAddress), ProtocolError> {
-    if payload.len() < 2 + 1 {
-        return Err(ProtocolError::Truncated);
-    }
-    let server_port = u16::from_be_bytes([payload[0], payload[1]]);
-    let proto =
-        Protocol::try_from(payload[2]).map_err(|_| ProtocolError::BadMessageType(payload[2]))?;
-    let (target, _) = TargetAddress::decode(&payload[3..])?;
-    Ok((server_port, proto, target))
-}
-
-pub fn build_conn_ready(conn_id: u64) -> Frame {
-    Frame {
-        msg_type: MessageType::ConnReady,
-        flags: 0,
-        conn_id,
-        payload: Bytes::new(),
-    }
-}
-
-pub fn build_conn_close(conn_id: u64) -> Frame {
-    Frame {
-        msg_type: MessageType::ConnClose,
-        flags: 0,
-        conn_id,
-        payload: Bytes::new(),
-    }
-}
-
-pub fn build_ping() -> Frame {
-    Frame {
-        msg_type: MessageType::Ping,
-        flags: 0,
-        conn_id: 0,
-        payload: Bytes::new(),
-    }
-}
-
-pub fn build_pong() -> Frame {
-    Frame {
-        msg_type: MessageType::Pong,
-        flags: 0,
-        conn_id: 0,
-        payload: Bytes::new(),
-    }
-}
-
-pub fn build_config_ack() -> Frame {
-    Frame {
-        msg_type: MessageType::ConfigAck,
-        flags: 0,
-        conn_id: 0,
-        payload: Bytes::new(),
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-#[repr(u16)]
-pub enum ErrorCode {
-    UnknownClient = 0x01,
-    PortUnavailable = 0x02,
-    ConnectionRefused = 0x03,
-    Timeout = 0x04,
-    ProtocolError = 0x05,
-}
-
-pub fn build_error(code: ErrorCode, msg: &str) -> Frame {
-    let mut p = BytesMut::new();
-    p.put_u16(code as u16);
-    let b = msg.as_bytes();
-    p.put_u16(b.len() as u16);
-    p.extend_from_slice(b);
-    Frame {
-        msg_type: MessageType::Fault,
-        flags: 0,
-        conn_id: 0,
-        payload: p.freeze(),
-    }
-}
-
-pub fn build_data_tcp(conn_id: u64, data: Bytes) -> Frame {
-    Frame {
-        msg_type: MessageType::DataTcp,
-        flags: 0,
-        conn_id,
-        payload: data,
-    }
-}
-
-pub fn build_data_udp(conn_id: u64, data: Bytes) -> Frame {
-    Frame {
-        msg_type: MessageType::DataUdp,
-        flags: 0,
-        conn_id,
-        payload: data,
-    }
-}
-
-/// Parse error/fault message payload.
-pub fn parse_error(payload: &[u8]) -> Result<(u16, String), ProtocolError> {
-    if payload.len() < 4 {
-        return Err(ProtocolError::Truncated);
-    }
-    let code = u16::from_be_bytes([payload[0], payload[1]]);
-    let msg_len = u16::from_be_bytes([payload[2], payload[3]]) as usize;
-    if payload.len() < 4 + msg_len {
-        return Err(ProtocolError::Truncated);
-    }
-    let message = std::str::from_utf8(&payload[4..4 + msg_len])
-        .map_err(|_| ProtocolError::InvalidUtf8)?
-        .to_string();
-    Ok((code, message))
 }
 
 // ============================================================================
@@ -605,15 +428,12 @@ mod tests {
         };
         let encoded = encode_frame(&frame);
 
-        // Partial header
         let mut partial = BytesMut::from(&encoded[..8]);
         assert!(decode_frame(&mut partial).unwrap().is_none());
 
-        // Partial payload
         let mut partial = BytesMut::from(&encoded[..FRAME_HEADER_SIZE + 2]);
         assert!(decode_frame(&mut partial).unwrap().is_none());
 
-        // Complete
         let mut complete = BytesMut::from(&encoded[..]);
         assert!(decode_frame(&mut complete).unwrap().is_some());
     }
@@ -644,7 +464,7 @@ mod tests {
     fn test_bad_message_type() {
         let mut buf = BytesMut::from(
             &[
-                0x4E, 0x54, 0x01, 0xFF, 0x00, 0x00, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0,
+                0x4E, 0x54, VERSION, 0xFF, 0x00, 0x00, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0,
             ][..],
         );
         let result = decode_frame(&mut buf);
@@ -661,7 +481,7 @@ mod tests {
         addr.encode(&mut buf);
         let (decoded, consumed) = TargetAddress::decode(&buf).unwrap();
         assert_eq!(decoded, addr);
-        assert_eq!(consumed, 7); // 1 type + 4 ipv4 + 2 port
+        assert_eq!(consumed, 7);
     }
 
     #[test]
@@ -674,7 +494,7 @@ mod tests {
         addr.encode(&mut buf);
         let (decoded, consumed) = TargetAddress::decode(&buf).unwrap();
         assert_eq!(decoded, addr);
-        assert_eq!(consumed, 19); // 1 type + 16 ipv6 + 2 port
+        assert_eq!(consumed, 19);
     }
 
     #[test]
@@ -687,7 +507,15 @@ mod tests {
         addr.encode(&mut buf);
         let (decoded, consumed) = TargetAddress::decode(&buf).unwrap();
         assert_eq!(decoded, addr);
-        assert_eq!(consumed, 1 + 1 + 11 + 2); // type + len + domain + port
+        assert_eq!(consumed, 1 + 1 + 11 + 2);
+    }
+
+    #[test]
+    fn test_target_address_empty_domain_rejected() {
+        // Manually craft a Domain TargetAddress with length=0.
+        let buf: &[u8] = &[AddressType::Domain as u8, 0x00, 0x00, 0x50];
+        let err = TargetAddress::decode(buf).unwrap_err();
+        assert!(matches!(err, ProtocolError::EmptyDomain));
     }
 
     #[test]
@@ -707,133 +535,20 @@ mod tests {
     }
 
     #[test]
-    fn test_register_roundtrip() {
-        let frame = build_register("test-client", Some("mykey"), Some(8080));
-        let (name, proxy, key) = parse_register(&frame.payload).unwrap();
-        assert_eq!(name, "test-client");
-        assert_eq!(proxy, Some(8080));
-        assert_eq!(key, Some("mykey".to_string()));
-    }
-
-    #[test]
-    fn test_register_no_proxy() {
-        let frame = build_register("client", None, None);
-        let (name, proxy, key) = parse_register(&frame.payload).unwrap();
-        assert_eq!(name, "client");
-        assert_eq!(proxy, None);
-        assert_eq!(key, None);
-    }
-
-    #[test]
-    fn test_register_ack_roundtrip() {
-        let frame = build_register_ack(12345678);
-        let client_id = parse_register_ack(&frame.payload).unwrap();
-        assert_eq!(client_id, 12345678);
-    }
-
-    #[test]
-    fn test_config_push_roundtrip() {
-        let mappings = vec![
-            PortMapping {
-                server_port: 8080,
-                protocol: Protocol::Tcp,
-                target: TargetAddress {
-                    host: Host::V4(Ipv4Addr::new(127, 0, 0, 1)),
-                    port: 80,
-                },
-            },
-            PortMapping {
-                server_port: 5353,
-                protocol: Protocol::Udp,
-                target: TargetAddress {
-                    host: Host::Domain("dns.local".to_string()),
-                    port: 53,
-                },
-            },
-        ];
-        let frame = build_config_push(&mappings);
-        let decoded = parse_config_push(&frame.payload).unwrap();
-        assert_eq!(decoded.len(), 2);
-        assert_eq!(decoded[0].server_port, 8080);
-        assert_eq!(decoded[0].protocol, Protocol::Tcp);
-        assert_eq!(decoded[1].server_port, 5353);
-        assert_eq!(decoded[1].protocol, Protocol::Udp);
-    }
-
-    #[test]
-    fn test_config_push_empty() {
-        let frame = build_config_push(&[]);
-        let decoded = parse_config_push(&frame.payload).unwrap();
-        assert!(decoded.is_empty());
-    }
-
-    #[test]
-    fn test_new_conn_roundtrip() {
-        let target = TargetAddress {
-            host: Host::V4(Ipv4Addr::new(10, 0, 0, 1)),
-            port: 22,
-        };
-        let frame = build_new_conn(999, 2222, Protocol::Tcp, &target);
-        let (port, proto, decoded_target) = parse_new_conn(&frame.payload).unwrap();
-        assert_eq!(port, 2222);
-        assert_eq!(proto, Protocol::Tcp);
-        assert_eq!(decoded_target, target);
-    }
-
-    #[test]
-    fn test_error_roundtrip() {
-        let frame = build_error(ErrorCode::ConnectionRefused, "connection refused");
-        let (code, msg) = parse_error(&frame.payload).unwrap();
-        assert_eq!(code, ErrorCode::ConnectionRefused as u16);
-        assert_eq!(msg, "connection refused");
-    }
-
-    #[test]
-    fn test_data_tcp() {
-        let data = Bytes::from_static(b"hello tcp");
-        let frame = build_data_tcp(123, data.clone());
-        assert_eq!(frame.msg_type, MessageType::DataTcp);
-        assert_eq!(frame.conn_id, 123);
-        assert_eq!(frame.payload, data);
-    }
-
-    #[test]
-    fn test_data_udp() {
-        let data = Bytes::from_static(b"hello udp");
-        let frame = build_data_udp(456, data.clone());
-        assert_eq!(frame.msg_type, MessageType::DataUdp);
-        assert_eq!(frame.conn_id, 456);
-        assert_eq!(frame.payload, data);
-    }
-
-    #[test]
-    fn test_ping_pong() {
-        let ping = build_ping();
-        assert_eq!(ping.msg_type, MessageType::Ping);
-        assert!(ping.payload.is_empty());
-
-        let pong = build_pong();
-        assert_eq!(pong.msg_type, MessageType::Pong);
-        assert!(pong.payload.is_empty());
-    }
-
-    #[test]
-    fn test_conn_ready_close() {
-        let ready = build_conn_ready(100);
-        assert_eq!(ready.msg_type, MessageType::ConnReady);
-        assert_eq!(ready.conn_id, 100);
-
-        let close = build_conn_close(100);
-        assert_eq!(close.msg_type, MessageType::ConnClose);
-        assert_eq!(close.conn_id, 100);
-    }
-
-    #[test]
     fn test_protocol_conversion() {
         assert_eq!(Protocol::try_from(0x00), Ok(Protocol::Tcp));
         assert_eq!(Protocol::try_from(0x01), Ok(Protocol::Udp));
         assert_eq!(Protocol::try_from(0x02), Ok(Protocol::Both));
+        assert_eq!(Protocol::try_from(0x03), Ok(Protocol::HttpProxy));
         assert!(Protocol::try_from(0x99).is_err());
+    }
+
+    #[test]
+    fn test_conn_protocol_rejects_both() {
+        assert_eq!(ConnProtocol::try_from(0x00), Ok(ConnProtocol::Tcp));
+        assert_eq!(ConnProtocol::try_from(0x01), Ok(ConnProtocol::Udp));
+        assert!(ConnProtocol::try_from(0x02).is_err());
+        assert!(ConnProtocol::try_from(0x99).is_err());
     }
 
     #[test]

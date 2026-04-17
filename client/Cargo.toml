@@ -9,8 +9,11 @@ path = "src/main.rs"
 
 [dependencies]
 anno-common = { path = "../common" }
-tokio = { version = "1.36", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }
-tokio-util = { version = "0.7", features = ["codec"] }
+tokio = { version = "1.36", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros", "signal"] }
+socket2 = { version = "0.5", features = ["all"] }
+rand = "0.8"
+metrics = "0.24.3"
+tokio-util = { version = "0.7", features = ["codec", "rt"] }
 bytes = "1.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

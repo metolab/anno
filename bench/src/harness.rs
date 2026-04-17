@@ -2,11 +2,16 @@
 
 use crate::api_client::ApiClient;
 use anyhow::{Context, Result};
+use serde_json::json;
+use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
+
+/// Fixed key written to the bench registry file and passed to `anno-client --key`.
+const BENCH_CLIENT_KEY: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
 
 pub struct TestHarness {
     pub server: Child,
@@ -50,12 +55,32 @@ impl TestHarness {
         // Let listeners bind.
         sleep(Duration::from_millis(50)).await;
 
+        let registry_path = std::env::temp_dir().join(format!(
+            "anno-bench-registry-{}.json",
+            std::process::id()
+        ));
+        let registry_body = json!({
+            "clients": [{
+                "name": args.client_name,
+                "key": BENCH_CLIENT_KEY,
+                "description": null,
+                "created_at": 0u64
+            }]
+        });
+        fs::write(
+            &registry_path,
+            serde_json::to_string_pretty(&registry_body).context("serialize bench registry")?,
+        )
+        .with_context(|| format!("write {}", registry_path.display()))?;
+
         let mut server_cmd = Command::new(&args.server_bin);
         server_cmd
             .arg("--control")
             .arg(control_addr.to_string())
             .arg("--api")
             .arg(api_addr.to_string())
+            .arg("--registry-file")
+            .arg(&registry_path)
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let server = server_cmd
@@ -70,8 +95,8 @@ impl TestHarness {
         client_cmd
             .arg("--server")
             .arg(control_addr.to_string())
-            .arg("--name")
-            .arg(&args.client_name)
+            .arg("--key")
+            .arg(BENCH_CLIENT_KEY)
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let client = client_cmd

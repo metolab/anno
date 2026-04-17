@@ -1,9 +1,14 @@
-//! Strongly-typed message definitions with automatic serialization.
+//! Strongly-typed protocol messages with automatic frame encoding/decoding.
 //!
-//! Each protocol message is represented as a Rust struct implementing the `Message` trait,
-//! providing type-safe encoding/decoding and better ergonomics than raw payload manipulation.
+//! Every protocol message has a dedicated struct implementing [`Message`].
+//! Use `msg.to_frame(conn_id)` to build a wire frame and `Msg::from_frame(&f)`
+//! to parse one. This is the only public encoding/decoding API — the
+//! low-level [`crate::protocol`] module is only used for the frame header
+//! itself plus shared enums/types.
 
-use crate::protocol::{Frame, MessageType, PortMapping, Protocol, ProtocolError, TargetAddress};
+use crate::protocol::{
+    ConnProtocol, Frame, MessageType, PortMapping, Protocol, ProtocolError, TargetAddress,
+};
 use bytes::{BufMut, Bytes, BytesMut};
 
 /// Trait for protocol messages that can be encoded/decoded from frames.
@@ -40,11 +45,10 @@ pub trait Message: Sized + Send + Sync {
 // Control Messages
 // ============================================================================
 
-/// Client registration request.
+/// Client registration request (v2 wire: http_proxy_port + key only).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Register {
-    pub name: String,
-    pub key: Option<String>,
+    pub key: String,
     pub http_proxy_port: Option<u16>,
 }
 
@@ -52,60 +56,36 @@ impl Message for Register {
     const MSG_TYPE: MessageType = MessageType::Register;
 
     fn encode_payload(&self) -> Bytes {
-        let name_bytes = self.name.as_bytes();
-        let key_bytes = self.key.as_deref().unwrap_or("").as_bytes();
-        let mut buf = BytesMut::with_capacity(2 + name_bytes.len() + 2 + key_bytes.len() + 2);
-        buf.put_u16(name_bytes.len() as u16);
-        buf.extend_from_slice(name_bytes);
-        buf.put_u16(self.http_proxy_port.unwrap_or(0));
-        buf.put_u16(key_bytes.len() as u16);
-        buf.extend_from_slice(key_bytes);
+        let hp = self.http_proxy_port.filter(|p| *p > 0).unwrap_or(0);
+        let key_bytes = self.key.as_bytes();
+        // Key is length-prefixed by u16: truncate to fit rather than silently
+        // wrap. Real keys are UUIDs (~36 bytes) so this only defends against
+        // misuse.
+        let key_len = key_bytes.len().min(u16::MAX as usize);
+        let mut buf = BytesMut::with_capacity(2 + 2 + key_len);
+        buf.put_u16(hp);
+        buf.put_u16(key_len as u16);
+        buf.extend_from_slice(&key_bytes[..key_len]);
         buf.freeze()
     }
 
     fn decode_payload(payload: &[u8]) -> Result<Self, ProtocolError> {
-        if payload.len() < 2 {
+        if payload.len() < 4 {
             return Err(ProtocolError::Truncated);
         }
-        let name_len = u16::from_be_bytes([payload[0], payload[1]]) as usize;
-        if payload.len() < 2 + name_len {
+        let hp = u16::from_be_bytes([payload[0], payload[1]]);
+        let http_proxy_port = if hp != 0 { Some(hp) } else { None };
+        let key_len = u16::from_be_bytes([payload[2], payload[3]]) as usize;
+        if key_len == 0 {
+            return Err(ProtocolError::InvalidRegisterPayload);
+        }
+        if payload.len() < 4 + key_len {
             return Err(ProtocolError::Truncated);
         }
-        let name = std::str::from_utf8(&payload[2..2 + name_len])
+        let key = std::str::from_utf8(&payload[4..4 + key_len])
             .map_err(|_| ProtocolError::InvalidUtf8)?
             .to_string();
-
-        let mut offset = 2 + name_len;
-
-        let http_proxy_port = if payload.len() >= offset + 2 {
-            let port = u16::from_be_bytes([payload[offset], payload[offset + 1]]);
-            offset += 2;
-            if port != 0 {
-                Some(port)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let key = if payload.len() >= offset + 2 {
-            let key_len = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
-            offset += 2;
-            if payload.len() >= offset + key_len && key_len > 0 {
-                let s = std::str::from_utf8(&payload[offset..offset + key_len])
-                    .map_err(|_| ProtocolError::InvalidUtf8)?
-                    .to_string();
-                Some(s)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
         Ok(Self {
-            name,
             key,
             http_proxy_port,
         })
@@ -148,8 +128,13 @@ impl Message for ConfigPush {
 
     fn encode_payload(&self) -> Bytes {
         let mut buf = BytesMut::new();
-        buf.put_u16(self.mappings.len() as u16);
-        for m in &self.mappings {
+        // Count is length-prefixed by u16 on the wire; saturate at
+        // u16::MAX and serialise only that many mappings so an oversized
+        // list does not silently truncate via an `as` cast that would
+        // wrap around and desynchronise the decoder.
+        let count = self.mappings.len().min(u16::MAX as usize);
+        buf.put_u16(count as u16);
+        for m in self.mappings.iter().take(count) {
             buf.put_u8(m.protocol as u8);
             buf.put_u16(m.server_port);
             m.target.encode(&mut buf);
@@ -246,10 +231,13 @@ impl Message for Pong {
 // ============================================================================
 
 /// Request to establish a new forwarding connection.
+///
+/// Per-connection protocol is strictly TCP or UDP (no `Both`), enforced
+/// by the [`ConnProtocol`] type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewConn {
     pub server_port: u16,
-    pub protocol: Protocol,
+    pub protocol: ConnProtocol,
     pub target: TargetAddress,
 }
 
@@ -269,8 +257,8 @@ impl Message for NewConn {
             return Err(ProtocolError::Truncated);
         }
         let server_port = u16::from_be_bytes([payload[0], payload[1]]);
-        let protocol = Protocol::try_from(payload[2])
-            .map_err(|_| ProtocolError::BadMessageType(payload[2]))?;
+        let protocol = ConnProtocol::try_from(payload[2])
+            .map_err(|_| ProtocolError::BadConnProtocol(payload[2]))?;
         let (target, _) = TargetAddress::decode(&payload[3..])?;
         Ok(Self {
             server_port,
@@ -361,29 +349,47 @@ impl Message for DataUdp {
 // ============================================================================
 
 /// Error codes for fault messages.
+///
+/// The `Unknown(u16)` variant preserves unrecognized codes verbatim so the
+/// decoder never loses information (previously an unknown value was mapped
+/// to `InternalError`, which was lossy and confusing in logs). The wire
+/// format is unchanged: the raw `u16` is what's serialised in both
+/// directions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u16)]
 pub enum ErrorCode {
-    UnknownClient = 0x01,
-    PortUnavailable = 0x02,
-    ConnectionRefused = 0x03,
-    Timeout = 0x04,
-    ProtocolError = 0x05,
-    InternalError = 0x06,
+    UnknownClient,
+    PortUnavailable,
+    ConnectionRefused,
+    Timeout,
+    ProtocolError,
+    InternalError,
+    Unknown(u16),
 }
 
-impl TryFrom<u16> for ErrorCode {
-    type Error = ();
-
-    fn try_from(v: u16) -> Result<Self, Self::Error> {
+impl From<u16> for ErrorCode {
+    fn from(v: u16) -> Self {
         match v {
-            0x01 => Ok(Self::UnknownClient),
-            0x02 => Ok(Self::PortUnavailable),
-            0x03 => Ok(Self::ConnectionRefused),
-            0x04 => Ok(Self::Timeout),
-            0x05 => Ok(Self::ProtocolError),
-            0x06 => Ok(Self::InternalError),
-            _ => Err(()),
+            0x01 => Self::UnknownClient,
+            0x02 => Self::PortUnavailable,
+            0x03 => Self::ConnectionRefused,
+            0x04 => Self::Timeout,
+            0x05 => Self::ProtocolError,
+            0x06 => Self::InternalError,
+            other => Self::Unknown(other),
+        }
+    }
+}
+
+impl From<ErrorCode> for u16 {
+    fn from(c: ErrorCode) -> u16 {
+        match c {
+            ErrorCode::UnknownClient => 0x01,
+            ErrorCode::PortUnavailable => 0x02,
+            ErrorCode::ConnectionRefused => 0x03,
+            ErrorCode::Timeout => 0x04,
+            ErrorCode::ProtocolError => 0x05,
+            ErrorCode::InternalError => 0x06,
+            ErrorCode::Unknown(v) => v,
         }
     }
 }
@@ -400,10 +406,15 @@ impl Message for Fault {
 
     fn encode_payload(&self) -> Bytes {
         let msg_bytes = self.message.as_bytes();
-        let mut buf = BytesMut::with_capacity(4 + msg_bytes.len());
-        buf.put_u16(self.code as u16);
-        buf.put_u16(msg_bytes.len() as u16);
-        buf.extend_from_slice(msg_bytes);
+        // Message is length-prefixed by u16 on the wire. Truncate to the
+        // largest value that still fits in the length field so the frame
+        // never carries a wrapped-around length that would desync the
+        // decoder on the peer.
+        let len = msg_bytes.len().min(u16::MAX as usize);
+        let mut buf = BytesMut::with_capacity(4 + len);
+        buf.put_u16(u16::from(self.code));
+        buf.put_u16(len as u16);
+        buf.extend_from_slice(&msg_bytes[..len]);
         buf.freeze()
     }
 
@@ -412,7 +423,7 @@ impl Message for Fault {
             return Err(ProtocolError::Truncated);
         }
         let code_raw = u16::from_be_bytes([payload[0], payload[1]]);
-        let code = ErrorCode::try_from(code_raw).unwrap_or(ErrorCode::InternalError);
+        let code = ErrorCode::from(code_raw);
         let msg_len = u16::from_be_bytes([payload[2], payload[3]]) as usize;
 
         if payload.len() < 4 + msg_len {
@@ -440,7 +451,6 @@ pub struct FrameBuilder {
 }
 
 impl FrameBuilder {
-    /// Create a new frame builder for a message.
     pub fn new<M: Message>(msg: &M) -> Self {
         Self {
             msg_type: M::MSG_TYPE,
@@ -450,19 +460,16 @@ impl FrameBuilder {
         }
     }
 
-    /// Set the connection ID.
     pub fn conn_id(mut self, id: u64) -> Self {
         self.conn_id = id;
         self
     }
 
-    /// Set custom flags.
     pub fn flags(mut self, flags: u8) -> Self {
         self.flags = flags;
         self
     }
 
-    /// Build the final frame.
     pub fn build(self) -> Frame {
         Frame {
             msg_type: self.msg_type,
@@ -474,14 +481,13 @@ impl FrameBuilder {
 }
 
 // ============================================================================
-// Convenience constructors (backwards compatibility)
+// Convenience constructors
 // ============================================================================
 
 impl Register {
-    pub fn new(name: impl Into<String>, key: Option<String>, http_proxy_port: Option<u16>) -> Self {
+    pub fn new(key: impl Into<String>, http_proxy_port: Option<u16>) -> Self {
         Self {
-            name: name.into(),
-            key,
+            key: key.into(),
             http_proxy_port,
         }
     }
@@ -500,7 +506,7 @@ impl ConfigPush {
 }
 
 impl NewConn {
-    pub fn new(server_port: u16, protocol: Protocol, target: TargetAddress) -> Self {
+    pub fn new(server_port: u16, protocol: ConnProtocol, target: TargetAddress) -> Self {
         Self {
             server_port,
             protocol,
@@ -533,30 +539,40 @@ impl Fault {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::Host;
+    use crate::protocol::{AddressType, Host};
     use std::net::Ipv4Addr;
 
     #[test]
     fn test_register_roundtrip() {
-        let msg = Register::new("test-client", Some("k1".to_string()), Some(8080));
-        let payload = msg.encode_payload();
-        let decoded = Register::decode_payload(&payload).unwrap();
+        let msg = Register::new("k1", Some(8080));
+        let frame = msg.to_frame(0);
+        let decoded = Register::from_frame(&frame).unwrap();
         assert_eq!(msg, decoded);
     }
 
     #[test]
     fn test_register_no_proxy() {
-        let msg = Register::new("client", None, None);
-        let payload = msg.encode_payload();
-        let decoded = Register::decode_payload(&payload).unwrap();
+        let msg = Register::new("client-key", None);
+        let frame = msg.to_frame(0);
+        let decoded = Register::from_frame(&frame).unwrap();
         assert_eq!(decoded.http_proxy_port, None);
+        assert_eq!(decoded.key, "client-key");
+    }
+
+    #[test]
+    fn test_register_rejects_zero_key_len() {
+        let mut p = BytesMut::new();
+        p.put_u16(0u16);
+        p.put_u16(0u16);
+        let err = Register::decode_payload(&p).unwrap_err();
+        assert!(matches!(err, ProtocolError::InvalidRegisterPayload));
     }
 
     #[test]
     fn test_register_ack_roundtrip() {
         let msg = RegisterAck::new(12345);
-        let payload = msg.encode_payload();
-        let decoded = RegisterAck::decode_payload(&payload).unwrap();
+        let frame = msg.to_frame(0);
+        let decoded = RegisterAck::from_frame(&frame).unwrap();
         assert_eq!(msg, decoded);
     }
 
@@ -580,16 +596,16 @@ mod tests {
                 },
             },
         ]);
-        let payload = msg.encode_payload();
-        let decoded = ConfigPush::decode_payload(&payload).unwrap();
+        let frame = msg.to_frame(0);
+        let decoded = ConfigPush::from_frame(&frame).unwrap();
         assert_eq!(msg, decoded);
     }
 
     #[test]
     fn test_config_push_empty() {
         let msg = ConfigPush::new(vec![]);
-        let payload = msg.encode_payload();
-        let decoded = ConfigPush::decode_payload(&payload).unwrap();
+        let frame = msg.to_frame(0);
+        let decoded = ConfigPush::from_frame(&frame).unwrap();
         assert_eq!(decoded.mappings.len(), 0);
     }
 
@@ -597,22 +613,36 @@ mod tests {
     fn test_new_conn_roundtrip() {
         let msg = NewConn::new(
             8080,
-            Protocol::Tcp,
+            ConnProtocol::Tcp,
             TargetAddress {
                 host: Host::V4(Ipv4Addr::new(192, 168, 1, 1)),
                 port: 80,
             },
         );
-        let payload = msg.encode_payload();
-        let decoded = NewConn::decode_payload(&payload).unwrap();
+        let frame = msg.to_frame(42);
+        let decoded = NewConn::from_frame(&frame).unwrap();
         assert_eq!(msg, decoded);
+        assert_eq!(frame.conn_id, 42);
+    }
+
+    #[test]
+    fn test_new_conn_rejects_both_on_wire() {
+        // server_port (2B) + proto(1B = 0x02 Both) + ipv4 target
+        let payload: &[u8] = &[
+            0x1F, 0x90, // port 8080
+            0x02, // Both — must be rejected
+            AddressType::Ipv4 as u8,
+            127, 0, 0, 1, 0, 80,
+        ];
+        let err = NewConn::decode_payload(payload).unwrap_err();
+        assert!(matches!(err, ProtocolError::BadConnProtocol(0x02)));
     }
 
     #[test]
     fn test_fault_roundtrip() {
         let msg = Fault::new(ErrorCode::ConnectionRefused, "connection refused by peer");
-        let payload = msg.encode_payload();
-        let decoded = Fault::decode_payload(&payload).unwrap();
+        let frame = msg.to_frame(0);
+        let decoded = Fault::from_frame(&frame).unwrap();
         assert_eq!(msg, decoded);
     }
 
@@ -626,11 +656,20 @@ mod tests {
     }
 
     #[test]
-    fn test_message_to_frame() {
-        let msg = RegisterAck::new(999);
-        let frame = msg.to_frame(0);
-        assert_eq!(frame.msg_type, MessageType::RegisterAck);
-        let decoded = RegisterAck::from_frame(&frame).unwrap();
-        assert_eq!(decoded.client_id, 999);
+    fn test_data_tcp_udp() {
+        let data = Bytes::from_static(b"hello");
+        let tcp = DataTcp::new(data.clone()).to_frame(1);
+        assert_eq!(tcp.msg_type, MessageType::DataTcp);
+        let udp = DataUdp::new(data.clone()).to_frame(2);
+        assert_eq!(udp.msg_type, MessageType::DataUdp);
+        let back_tcp = DataTcp::from_frame(&tcp).unwrap();
+        assert_eq!(back_tcp.data, data);
+    }
+
+    #[test]
+    fn test_from_frame_wrong_type() {
+        let ping = Ping.to_frame(0);
+        let err = Pong::from_frame(&ping).unwrap_err();
+        assert!(matches!(err, ProtocolError::BadMessageType(_)));
     }
 }
