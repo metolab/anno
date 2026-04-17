@@ -25,7 +25,7 @@ use crate::registry::{ClientRegistry, StoredMappingJson};
 use crate::session::{SessionConfig, SessionManager};
 use anno_common::{Frame, Host, Protocol, TargetAddress};
 use dashmap::DashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -124,6 +124,10 @@ pub struct AppConfig {
     pub register_timeout: Duration,
     /// Public listener bind address (shared by all port mappings).
     pub public_bind: IpAddr,
+    /// Control-plane listen address (`--control`). Surfaced on the
+    /// dashboard so operators can copy the `host:port` their clients
+    /// should connect to.
+    pub control_addr: SocketAddr,
 }
 
 impl Default for AppConfig {
@@ -139,6 +143,7 @@ impl Default for AppConfig {
             control_idle_timeout: Duration::from_secs(60),
             register_timeout: Duration::from_secs(10),
             public_bind: IpAddr::from_str("0.0.0.0").unwrap(),
+            control_addr: SocketAddr::from_str("0.0.0.0:9000").unwrap(),
         }
     }
 }

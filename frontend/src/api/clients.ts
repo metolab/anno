@@ -27,6 +27,7 @@ export type StatsDto = {
   queue_drops_total: number;
   bytes_up_total: number;
   bytes_down_total: number;
+  control_port: number;
 };
 
 export async function fetchClients(): Promise<ClientDto[]> {

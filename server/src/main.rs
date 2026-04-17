@@ -187,6 +187,7 @@ async fn main() {
         control_idle_timeout: Duration::from_secs(args.control_idle_timeout_secs),
         register_timeout: Duration::from_secs(args.register_timeout_secs),
         public_bind: args.public_bind,
+        control_addr: args.control,
     };
 
     let registry = ClientRegistry::load(&args.registry_file);

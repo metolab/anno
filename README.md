@@ -205,6 +205,110 @@ Authorization: Bearer <token>
 
 ---
 
+## systemd 部署
+
+从 GitHub Release 拉取预编译二进制，创建配置目录和环境变量文件，再装一个 `Restart=always` 的 systemd unit 即可。需要 `curl` 与 `htpasswd`（后者来自 `apache2-utils` / `httpd-tools`）。
+
+### 1. 拉取二进制
+
+```bash
+ARCH=$(uname -m); [ "$ARCH" = "arm64" ] && ARCH=aarch64
+BASE=https://github.com/metolab/anno/releases/latest/download
+
+# 服务端机器
+sudo curl -fL "$BASE/anno-server-$ARCH" -o /usr/local/bin/anno-server
+sudo chmod +x /usr/local/bin/anno-server
+
+# 客户端机器
+sudo curl -fL "$BASE/anno-client-$ARCH" -o /usr/local/bin/anno-client
+sudo chmod +x /usr/local/bin/anno-client
+```
+
+### 2. 创建配置目录与环境变量文件
+
+```bash
+sudo install -d -m 0750 /etc/anno
+```
+
+**服务端** `/etc/anno/server.env`（生成 bcrypt 密码哈希并写入）：
+
+```bash
+read -rsp "admin password: " P; echo
+HASH=$(htpasswd -bnBC 10 "" "$P" | tr -d ':\n' | sed 's/$2y/$2b/')
+sudo tee /etc/anno/server.env >/dev/null <<EOF
+ADMIN_PASSWORD_HASH=$HASH
+RUST_LOG=info
+ANNO_SERVER_ARGS=--control 0.0.0.0:9000 --api 0.0.0.0:8080 --registry-file /etc/anno/clients.json
+EOF
+unset P HASH
+```
+
+**客户端** `/etc/anno/client.env`（`ANNO_KEY` 由服务端 Web 后台生成）：
+
+```bash
+sudo tee /etc/anno/client.env >/dev/null <<'EOF'
+ANNO_SERVER=1.2.3.4:9000
+ANNO_KEY=xxxx-xxxx-xxxx
+RUST_LOG=info
+ANNO_CLIENT_ARGS=--http-proxy 0
+EOF
+```
+
+### 3. 写入 systemd unit
+
+`Restart=always` + `RestartSec=3` 实现无限重启；`EnvironmentFile=-` 前缀表示文件不存在也不报错。
+
+`**/etc/systemd/system/anno-server.service**`：
+
+```ini
+[Unit]
+Description=anno server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/anno/server.env
+ExecStart=/usr/local/bin/anno-server $ANNO_SERVER_ARGS
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`**/etc/systemd/system/anno-client.service**`：
+
+```ini
+[Unit]
+Description=anno client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/anno/client.env
+ExecStart=/usr/local/bin/anno-client --server ${ANNO_SERVER} --key ${ANNO_KEY} $ANNO_CLIENT_ARGS
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### 4. 启用
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now anno-server    # 服务端
+sudo systemctl enable --now anno-client    # 客户端
+journalctl -u anno-server -f               # 查看日志
+```
+
+---
+
 ## 功能黑盒测试
 
 依赖：`bash`、`curl`、`python3`。在项目根目录执行：

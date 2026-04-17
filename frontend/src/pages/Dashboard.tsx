@@ -29,6 +29,23 @@ export default function DashboardPage() {
       <Row gutter={[16, 16]}>
         <Col xs={24} sm={12} md={8}>
           <Card>
+            <Statistic
+              title="Control Port"
+              value={stats?.control_port ?? 0}
+              groupSeparator=""
+              suffix={
+                stats?.control_port != null ? (
+                  <Typography.Text
+                    copyable={{ text: String(stats.control_port) }}
+                    style={{ fontSize: 14 }}
+                  />
+                ) : null
+              }
+            />
+          </Card>
+        </Col>
+        <Col xs={24} sm={12} md={8}>
+          <Card>
             <Statistic title="Clients Online" value={stats?.clients_online ?? 0} />
           </Card>
         </Col>

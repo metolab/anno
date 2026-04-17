@@ -223,6 +223,27 @@ pub struct StatsDto {
     pub queue_drops_total: u64,
     pub bytes_up_total: u64,
     pub bytes_down_total: u64,
+    /// Control-plane listen port. Surfaced on the dashboard so operators
+    /// can copy it into client `--server host:port` configs.
+    pub control_port: u16,
+    /// Snapshot of every public port the server is currently listening on
+    /// for tunnelled traffic, so the UI can display the complete set of
+    /// data ports in one place.
+    pub listening_ports: Vec<ListeningPortDto>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct ListeningPortDto {
+    pub port: u16,
+    /// `tcp` / `udp` / `both` / `http_proxy`, copied from the owning
+    /// mapping. Falls back to `"unknown"` if the mapping entry cannot
+    /// be located (only possible for a fleeting window during reconcile).
+    pub protocol: String,
+    /// `binding` while the async bind is still in flight, `active`
+    /// once the listener task has started.
+    pub status: &'static str,
+    pub client_id: u64,
+    pub client_name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -614,6 +635,41 @@ async fn stats(State(state): State<AppState>) -> Json<StatsDto> {
 
     let tunnel = state.session_manager().aggregate_tunnel_stats();
 
+    let mut listening_ports: Vec<ListeningPortDto> = state
+        .listeners()
+        .iter()
+        .map(|entry| {
+            let port = *entry.key();
+            let rec = entry.value();
+            let client_id = rec.client_id();
+            let status = match rec {
+                crate::state::ListenerRecord::Binding { .. } => "binding",
+                crate::state::ListenerRecord::Active { .. } => "active",
+            };
+            let (client_name, protocol) = match state.clients().get(&client_id) {
+                Some(c) => {
+                    let name = c.name.clone();
+                    let proto = c
+                        .mappings
+                        .iter()
+                        .find(|m| m.server_port == port)
+                        .map(|m| protocol_to_str(m.protocol).to_string())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    (name, proto)
+                }
+                None => (String::new(), "unknown".to_string()),
+            };
+            ListeningPortDto {
+                port,
+                protocol,
+                status,
+                client_id,
+                client_name,
+            }
+        })
+        .collect();
+    listening_ports.sort_by_key(|p| p.port);
+
     Json(StatsDto {
         clients_online: online,
         clients_total: state.clients().len(),
@@ -624,6 +680,8 @@ async fn stats(State(state): State<AppState>) -> Json<StatsDto> {
         queue_drops_total: tunnel.queue_drops_total,
         bytes_up_total: tunnel.bytes_up_total,
         bytes_down_total: tunnel.bytes_down_total,
+        control_port: state.config().control_addr.port(),
+        listening_ports,
     })
 }
 
