@@ -6,11 +6,13 @@
 //! login overwrites the previous token. TTL / multi-session was explicitly
 //! out of scope for this refactor.
 
+use crate::state::AuthModeKind;
 use std::sync::RwLock;
 
 /// Thin wrapper over an `RwLock<Option<String>>` for the current admin
 /// bearer token + an optional bcrypt hash for password verification.
 pub struct AuthService {
+    auth_mode: AuthModeKind,
     password_hash: Option<String>,
     current_token: RwLock<Option<String>>,
 }
@@ -27,8 +29,9 @@ pub enum AuthError {
 }
 
 impl AuthService {
-    pub fn new(password_hash: Option<String>) -> Self {
+    pub fn new(auth_mode: AuthModeKind, password_hash: Option<String>) -> Self {
         Self {
+            auth_mode,
             password_hash,
             current_token: RwLock::new(None),
         }
@@ -36,7 +39,10 @@ impl AuthService {
 
     /// Whether any authentication method is configured.
     pub fn needs_auth(&self) -> bool {
-        self.password_hash.is_some()
+        matches!(
+            self.auth_mode,
+            AuthModeKind::Password | AuthModeKind::Oidc
+        )
     }
 
     /// Install a new session token, replacing any previous one.
@@ -55,6 +61,9 @@ impl AuthService {
     /// intentionally slow (≥10ms at the default cost of 12), so we always
     /// run it on the blocking pool to avoid stalling the async reactor.
     pub async fn verify_password(&self, password: &str) -> Result<bool, AuthError> {
+        if self.auth_mode != AuthModeKind::Password {
+            return Err(AuthError::NotConfigured);
+        }
         let hash = self.password_hash.as_deref().ok_or(AuthError::NotConfigured)?;
         let hash = hash.to_string();
         let password = password.to_string();

@@ -15,6 +15,8 @@ export type MappingDto = {
   protocol: string;
   target: string;
   active_connections: number;
+  bytes_up: number;
+  bytes_down: number;
 };
 
 export type StatsDto = {
@@ -61,4 +63,16 @@ export async function deleteMapping(clientId: number, serverPort: number) {
 
 export async function disconnectClient(clientId: number) {
   await api.post(`/api/clients/${clientId}/disconnect`);
+}
+
+/// Human-friendly byte size formatter shared by Dashboard and per-mapping
+/// traffic columns. Keeps the unit boundary at 1024 (binary) for parity
+/// with the existing Dashboard rendering.
+export function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return "-";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024)
+    return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }

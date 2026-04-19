@@ -5,13 +5,15 @@ use crate::listener::{RejectReason, SyncReport};
 use crate::ratelimit::LoginDecision;
 use crate::registry::ClientEntry;
 use crate::state::{
-    stored_mapping_to_json, stored_to_port_mapping, AppState, StoredMapping,
+    stored_mapping_to_json, stored_to_port_mapping, AppState, AuthModeKind, StoredMapping,
 };
 use anno_common::{ConfigPush, Host, Message, PortMapping, Protocol, TargetAddress};
-use axum::extract::{ConnectInfo, Path, Request, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::body::Body;
+use axum::extract::{ConnectInfo, Path, Query, Request, State};
+use axum::http::header;
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
-use axum::response::{IntoResponse, Response};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use metrics_exporter_prometheus::PrometheusHandle;
@@ -210,6 +212,14 @@ pub struct MappingDto {
     pub protocol: String,
     pub target: String,
     pub active_connections: u64,
+    /// Cumulative bytes uploaded through this mapping since the server
+    /// started (or since the mapping was last (re)created). Includes
+    /// already-closed sessions, so the value is monotonic across session
+    /// churn and resets only on server restart or mapping deletion.
+    pub bytes_up: u64,
+    /// Cumulative bytes downloaded through this mapping. Same semantics
+    /// as `bytes_up`.
+    pub bytes_down: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -273,6 +283,11 @@ pub fn router(
         .route("/api/login", post(login))
         .layer(RequestBodyLimitLayer::new(64 * 1024));
 
+    let public_auth = Router::new()
+        .route("/api/auth/config", get(auth_config))
+        .route("/api/auth/oidc/login", get(oidc_login))
+        .route("/api/auth/oidc/callback", get(oidc_callback));
+
     let api_routes = Router::new()
         .route("/api/clients", get(list_clients))
         .route("/api/clients/:id", get(get_client))
@@ -306,7 +321,10 @@ pub fn router(
         ))
         .layer(RequestBodyLimitLayer::new(64 * 1024));
 
-    let mut app = Router::new().merge(login_route).merge(api_routes);
+    let mut app = Router::new()
+        .merge(login_route)
+        .merge(public_auth)
+        .merge(api_routes);
 
     if include_metrics {
         let metrics_route = Router::new()
@@ -392,21 +410,22 @@ async fn disconnect_client(
         return Err(ApiError::not_found("client"));
     }
 
-    // Stop all public listeners for this client (via the actor → serial).
-    state.listeners_handle().stop_client(id).await;
+    // Graceful path: send GoAway, give bridged sessions a window to
+    // finish, then hard-cancel. `goaway_then_disconnect` is a no-op
+    // when the client is already offline, which keeps the API result
+    // semantics ("client is gone after this returns") intact.
+    crate::control::goaway_then_disconnect(
+        &state,
+        id,
+        anno_common::ErrorCode::ProtocolError,
+        "admin disconnect",
+    )
+    .await;
 
-    // Tear down tunnel sessions (wakes pending ConnReady waiters too).
-    state.session_manager().remove_client_sessions(id);
-
-    // Explicit cancel: signal the control loop and all per-session tasks
-    // that share this token to stop, then clear the online entry. This is
-    // the key fix vs. "just set online = None" — previously we'd rely on
-    // the control's write_task detecting the Sender drop, which could
-    // lag arbitrarily under load.
+    // Drop the in-memory online marker so subsequent /api/clients
+    // reflects the disconnection immediately.
     if let Some(mut rec) = state.clients().get_mut(&id) {
-        if let Some(online) = rec.online.take() {
-            online.cancel.cancel();
-        }
+        rec.online = None;
     }
 
     Ok(StatusCode::NO_CONTENT)
@@ -421,7 +440,7 @@ async fn list_mappings(
             let v: Vec<MappingDto> = c
                 .mappings
                 .iter()
-                .map(|m| mapping_to_dto(m, &state))
+                .map(|m| mapping_to_dto(id, m, &state))
                 .collect();
             Ok(Json(v))
         }
@@ -517,7 +536,7 @@ async fn add_mapping(
         return Err(reject_reason_to_error(body.server_port, reason));
     }
 
-    Ok((StatusCode::CREATED, Json(mapping_to_dto(&sm, &state))))
+    Ok((StatusCode::CREATED, Json(mapping_to_dto(id, &sm, &state))))
 }
 
 async fn update_mapping(
@@ -596,7 +615,7 @@ async fn update_mapping(
         return Err(reject_reason_to_error(port, reason));
     }
 
-    Ok(Json(mapping_to_dto(&sm, &state)))
+    Ok(Json(mapping_to_dto(id, &sm, &state)))
 }
 
 async fn delete_mapping(
@@ -619,6 +638,9 @@ async fn delete_mapping(
     persist_client_mappings(&state, id);
 
     state.listeners_handle().stop_port(port).await;
+    state
+        .session_manager()
+        .forget_mapping_traffic(id, port);
     push_config_if_online(&state, id).await;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -709,13 +731,16 @@ fn client_to_dto(id: u64, c: &crate::state::ClientRecord, state: &AppState) -> C
         mappings: c
             .mappings
             .iter()
-            .map(|m| mapping_to_dto(m, state))
+            .map(|m| mapping_to_dto(id, m, state))
             .collect(),
     }
 }
 
-fn mapping_to_dto(m: &StoredMapping, state: &AppState) -> MappingDto {
+fn mapping_to_dto(client_id: u64, m: &StoredMapping, state: &AppState) -> MappingDto {
     let active_connections = state.session_manager().count_by_port(m.server_port) as u64;
+    let (bytes_up, bytes_down) = state
+        .session_manager()
+        .mapping_traffic(client_id, m.server_port);
     let target = match m.protocol {
         Protocol::HttpProxy => "→ client http proxy".to_string(),
         _ => format_target(&m.target),
@@ -725,6 +750,8 @@ fn mapping_to_dto(m: &StoredMapping, state: &AppState) -> MappingDto {
         protocol: protocol_to_str(m.protocol).to_string(),
         target,
         active_connections,
+        bytes_up,
+        bytes_down,
     }
 }
 
@@ -821,6 +848,11 @@ struct LoginRes {
     token: String,
 }
 
+#[derive(Debug, Serialize)]
+struct AuthConfigDto {
+    auth_mode: AuthModeKind,
+}
+
 /// Derive the client IP. Honours `X-Forwarded-For`'s left-most entry when
 /// the request came from a trusted reverse proxy; otherwise falls back to
 /// the direct peer address from `ConnectInfo`.
@@ -837,12 +869,115 @@ fn extract_client_ip(headers: &HeaderMap, connect: Option<SocketAddr>) -> IpAddr
         .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
 }
 
+async fn auth_config(State(state): State<AppState>) -> Json<AuthConfigDto> {
+    Json(AuthConfigDto {
+        auth_mode: state.config().auth_mode,
+    })
+}
+
+fn redirect_to_login_fragment(fragment: &str) -> Response {
+    let loc = format!("/login#{fragment}");
+    let hv = HeaderValue::from_str(&loc).unwrap_or_else(|_| HeaderValue::from_static("/login"));
+    Response::builder()
+        .status(StatusCode::FOUND)
+        .header(header::LOCATION, hv)
+        .body(Body::empty())
+        .expect("empty body")
+}
+
+async fn oidc_login(
+    State(state): State<AppState>,
+    connect: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+) -> Result<Redirect, ApiError> {
+    let Some(oidc) = state.oidc().cloned() else {
+        return Err(ApiError::bad_request("OIDC not configured"));
+    };
+    let ip = extract_client_ip(&headers, connect.map(|ConnectInfo(s)| s));
+    let rl = state.login_rate_limiter();
+    if let LoginDecision::Deny { retry_after_secs } = rl.check(ip) {
+        return Err(ApiError::too_many_requests(retry_after_secs));
+    }
+
+    oidc.prune_stale_pending();
+    let url = oidc
+        .begin_login()
+        .map_err(|e| ApiError::internal(format!("OIDC authorize URL: {e}")))?;
+    rl.record_success(ip);
+
+    Ok(Redirect::temporary(url.as_str()))
+}
+
+#[derive(Debug, Deserialize)]
+struct OidcCallbackQuery {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+    #[serde(default)]
+    error_description: Option<String>,
+}
+
+async fn oidc_callback(
+    State(state): State<AppState>,
+    Query(q): Query<OidcCallbackQuery>,
+    connect: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+) -> Response {
+    let ip = extract_client_ip(&headers, connect.map(|ConnectInfo(s)| s));
+    let rl = state.login_rate_limiter();
+    if let LoginDecision::Deny { retry_after_secs } = rl.check(ip) {
+        return ApiError::too_many_requests(retry_after_secs).into_response();
+    }
+
+    if q.error.is_some() {
+        tracing::warn!(
+            error = ?q.error,
+            description = ?q.error_description,
+            "OIDC provider returned error"
+        );
+        rl.record_failure(ip);
+        return redirect_to_login_fragment("error=oidc_idp_error");
+    }
+
+    let Some(oidc) = state.oidc().cloned() else {
+        return redirect_to_login_fragment("error=oidc_not_configured");
+    };
+
+    let (code, st) = match (q.code.as_deref(), q.state.as_deref()) {
+        (Some(c), Some(s)) => (c, s),
+        _ => {
+            rl.record_failure(ip);
+            return redirect_to_login_fragment("error=oidc_missing_param");
+        }
+    };
+
+    match oidc.finish_login(code, st).await {
+        Ok((token, sub)) => {
+            tracing::info!(subject = %sub, "OIDC login succeeded");
+            rl.record_success(ip);
+            state.set_token(token.clone());
+            redirect_to_login_fragment(&format!("token={token}"))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "OIDC token exchange or validation failed");
+            rl.record_failure(ip);
+            redirect_to_login_fragment("error=oidc_callback_failed")
+        }
+    }
+}
+
 async fn login(
     State(state): State<AppState>,
     connect: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     Json(body): Json<LoginReq>,
 ) -> ApiResult<Json<LoginRes>> {
+    if state.config().auth_mode == AuthModeKind::Oidc {
+        return Err(ApiError::bad_request(
+            "password authentication disabled; use SSO (OIDC)",
+        ));
+    }
+
     let ip = extract_client_ip(&headers, connect.map(|ConnectInfo(s)| s));
     let rl = state.login_rate_limiter();
     if let LoginDecision::Deny { retry_after_secs } = rl.check(ip) {
@@ -984,6 +1119,9 @@ async fn registry_delete(
 
     state.listeners_handle().stop_client(client_id).await;
     state.session_manager().remove_client_sessions(client_id);
+    state
+        .session_manager()
+        .forget_client_mapping_traffic(client_id);
 
     // Explicit cancel before removing the client record — any in-flight
     // per-session task sharing this cancel will unwind immediately.

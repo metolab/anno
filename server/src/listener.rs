@@ -22,9 +22,12 @@ use anno_common::Protocol;
 use std::collections::HashSet;
 use tokio::sync::{mpsc, oneshot};
 
-/// Channel capacity for the listener command queue. In practice queue depth
-/// is bounded by concurrent API handlers.
-const COMMAND_CHANNEL_CAPACITY: usize = 256;
+/// Default channel capacity for the listener command queue. In
+/// practice queue depth is bounded by concurrent API handlers, but
+/// large registry-deletion bursts can push higher; making this
+/// configurable via [`crate::state::AppConfig::listener_command_capacity`]
+/// lets operators raise it without recompiling.
+pub const DEFAULT_COMMAND_CHANNEL_CAPACITY: usize = 256;
 
 /// Report produced by `SyncClient`: lists the ports the actor could not
 /// activate together with the reason. API callers use this to roll back
@@ -142,10 +145,22 @@ impl ListenerHandle {
 
 /// Construct a listener actor channel without spawning yet. The caller must
 /// call [`spawn_listener_actor`] once `AppState` is available so the actor
-/// can be wired to read mappings from it.
-pub fn make_handle() -> (ListenerHandle, mpsc::Receiver<ListenerCommand>) {
-    let (tx, rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
+/// can be wired to read mappings from it. Channel capacity defaults to
+/// [`DEFAULT_COMMAND_CHANNEL_CAPACITY`]; pass `Some(n)` to override (e.g.
+/// from `AppConfig::listener_command_capacity`).
+pub fn make_handle_with_capacity(
+    capacity: Option<usize>,
+) -> (ListenerHandle, mpsc::Receiver<ListenerCommand>) {
+    let cap = capacity
+        .filter(|c| *c > 0)
+        .unwrap_or(DEFAULT_COMMAND_CHANNEL_CAPACITY);
+    let (tx, rx) = mpsc::channel(cap);
     (ListenerHandle { tx }, rx)
+}
+
+#[cfg(test)]
+pub fn make_handle() -> (ListenerHandle, mpsc::Receiver<ListenerCommand>) {
+    make_handle_with_capacity(None)
 }
 
 /// Spawn the reconciliation actor. Must be called exactly once after

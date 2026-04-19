@@ -45,11 +45,46 @@ pub trait Message: Sized + Send + Sync {
 // Control Messages
 // ============================================================================
 
-/// Client registration request (v2 wire: http_proxy_port + key only).
+/// Default number of physical TCP lanes per client mux session.
+pub const DEFAULT_LANES: u8 = 4;
+/// Hard cap on the number of physical TCP lanes the protocol supports.
+/// Picked so a malicious peer cannot exhaust file descriptors via a single
+/// `Register`. Server may still grant fewer.
+pub const MAX_LANES: u8 = 16;
+/// Default maximum frame size (per shard) negotiated for new sessions.
+/// 16 KiB matches HTTP/2 default `SETTINGS_MAX_FRAME_SIZE` and gives a
+/// good fairness/syscall trade-off.
+pub const DEFAULT_MAX_FRAME_SIZE: u16 = 16 * 1024;
+/// Hard floor — frames smaller than this are rejected during negotiation
+/// so that a degenerate value cannot make every TCP read into a frame.
+pub const MIN_MAX_FRAME_SIZE: u16 = 1024;
+/// Default per-stream credit window (bytes). Receiver acks every
+/// `initial_window/2` bytes via `WindowUpdate`.
+pub const DEFAULT_INITIAL_WINDOW: u32 = 256 * 1024;
+
+/// Client registration request.
+///
+/// Wire layout (v3):
+///   u16 http_proxy_port (0 means none)
+///   u16 key_len
+///   [key_len] bytes of key
+///   u8  requested_lanes (0 means "use server default")
+///   u16 max_frame_size  (0 means "use server default")
+///   u32 initial_window  (0 means "use server default")
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Register {
     pub key: String,
     pub http_proxy_port: Option<u16>,
+    /// Number of physical TCP lanes the client wants for this session.
+    /// 0 asks the server to pick its default. Server enforces an upper
+    /// bound and echoes the granted count in `RegisterAck::granted_lanes`.
+    pub requested_lanes: u8,
+    /// Largest single shard the client is willing to send/accept on the
+    /// wire. 0 asks for the server default. Negotiated value is the
+    /// `min` of both peers, clamped to `MIN_MAX_FRAME_SIZE`.
+    pub max_frame_size: u16,
+    /// Initial per-stream credit window (bytes). 0 means default.
+    pub initial_window: u32,
 }
 
 impl Message for Register {
@@ -62,10 +97,13 @@ impl Message for Register {
         // wrap. Real keys are UUIDs (~36 bytes) so this only defends against
         // misuse.
         let key_len = key_bytes.len().min(u16::MAX as usize);
-        let mut buf = BytesMut::with_capacity(2 + 2 + key_len);
+        let mut buf = BytesMut::with_capacity(2 + 2 + key_len + 1 + 2 + 4);
         buf.put_u16(hp);
         buf.put_u16(key_len as u16);
         buf.extend_from_slice(&key_bytes[..key_len]);
+        buf.put_u8(self.requested_lanes);
+        buf.put_u16(self.max_frame_size);
+        buf.put_u32(self.initial_window);
         buf.freeze()
     }
 
@@ -85,25 +123,73 @@ impl Message for Register {
         let key = std::str::from_utf8(&payload[4..4 + key_len])
             .map_err(|_| ProtocolError::InvalidUtf8)?
             .to_string();
+        let mut off = 4 + key_len;
+        // The mux negotiation tail is optional so a v3 server can accept a
+        // future "minimal" client (or a test fixture) that omits it; missing
+        // bytes mean "use defaults".
+        let requested_lanes = if payload.len() > off {
+            let v = payload[off];
+            off += 1;
+            v
+        } else {
+            0
+        };
+        let max_frame_size = if payload.len() >= off + 2 {
+            let v = u16::from_be_bytes([payload[off], payload[off + 1]]);
+            off += 2;
+            v
+        } else {
+            0
+        };
+        let initial_window = if payload.len() >= off + 4 {
+            u32::from_be_bytes([
+                payload[off],
+                payload[off + 1],
+                payload[off + 2],
+                payload[off + 3],
+            ])
+        } else {
+            0
+        };
         Ok(Self {
             key,
             http_proxy_port,
+            requested_lanes,
+            max_frame_size,
+            initial_window,
         })
     }
 }
 
 /// Server acknowledgment of registration.
+///
+/// Wire layout (v3):
+///   u64 client_id
+///   u64 session_token (echoed back via `LaneHello` for the 2..N lanes)
+///   u8  granted_lanes
+///   u16 max_frame_size
+///   u32 initial_window
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RegisterAck {
     pub client_id: u64,
+    /// Opaque token the server assigns to this mux session. Bigger lanes
+    /// (i.e. lane 1..N) attach by quoting it back in [`LaneHello`].
+    pub session_token: u64,
+    pub granted_lanes: u8,
+    pub max_frame_size: u16,
+    pub initial_window: u32,
 }
 
 impl Message for RegisterAck {
     const MSG_TYPE: MessageType = MessageType::RegisterAck;
 
     fn encode_payload(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(8);
+        let mut buf = BytesMut::with_capacity(8 + 8 + 1 + 2 + 4);
         buf.put_u64(self.client_id);
+        buf.put_u64(self.session_token);
+        buf.put_u8(self.granted_lanes);
+        buf.put_u16(self.max_frame_size);
+        buf.put_u32(self.initial_window);
         buf.freeze()
     }
 
@@ -111,9 +197,186 @@ impl Message for RegisterAck {
         if payload.len() < 8 {
             return Err(ProtocolError::Truncated);
         }
+        let client_id = u64::from_be_bytes(payload[..8].try_into().unwrap());
+        // Tail is optional so a v3 server that hasn't yet been upgraded to
+        // emit the mux negotiation block still parses cleanly with
+        // defaults.
+        let session_token = if payload.len() >= 16 {
+            u64::from_be_bytes(payload[8..16].try_into().unwrap())
+        } else {
+            0
+        };
+        let granted_lanes = if payload.len() >= 17 { payload[16] } else { 1 };
+        let max_frame_size = if payload.len() >= 19 {
+            u16::from_be_bytes([payload[17], payload[18]])
+        } else {
+            DEFAULT_MAX_FRAME_SIZE
+        };
+        let initial_window = if payload.len() >= 23 {
+            u32::from_be_bytes([payload[19], payload[20], payload[21], payload[22]])
+        } else {
+            DEFAULT_INITIAL_WINDOW
+        };
         Ok(Self {
-            client_id: u64::from_be_bytes(payload[..8].try_into().unwrap()),
+            client_id,
+            session_token,
+            granted_lanes,
+            max_frame_size,
+            initial_window,
         })
+    }
+}
+
+/// Per-stream credit-based flow control update.
+///
+/// `frame.conn_id` selects the target stream. The receiver of `DataTcp`
+/// emits `WindowUpdate(increment)` once it has consumed `increment` bytes
+/// out of the previously-advertised window. The sender adds `increment`
+/// to its `send_credit` and resumes if previously parked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowUpdate {
+    pub increment: u32,
+}
+
+impl Message for WindowUpdate {
+    const MSG_TYPE: MessageType = MessageType::WindowUpdate;
+
+    fn encode_payload(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(4);
+        buf.put_u32(self.increment);
+        buf.freeze()
+    }
+
+    fn decode_payload(payload: &[u8]) -> Result<Self, ProtocolError> {
+        if payload.len() < 4 {
+            return Err(ProtocolError::Truncated);
+        }
+        let increment = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+        Ok(Self { increment })
+    }
+}
+
+impl WindowUpdate {
+    pub fn new(increment: u32) -> Self {
+        Self { increment }
+    }
+}
+
+/// Graceful-shutdown notification.
+///
+/// Sent by either peer to indicate that no new streams beyond
+/// `last_accepted_conn_id` will be honoured; in-flight streams may
+/// drain. After a grace period the connection is closed.
+///
+/// Wire layout:
+///   u64 last_accepted_conn_id
+///   u16 code (mirrors `ErrorCode` numeric space)
+///   u16 reason_len
+///   [reason_len] bytes utf-8 reason
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoAway {
+    pub last_accepted_conn_id: u64,
+    pub code: ErrorCode,
+    pub reason: String,
+}
+
+impl Message for GoAway {
+    const MSG_TYPE: MessageType = MessageType::GoAway;
+
+    fn encode_payload(&self) -> Bytes {
+        let bytes = self.reason.as_bytes();
+        let len = bytes.len().min(u16::MAX as usize);
+        let mut buf = BytesMut::with_capacity(8 + 2 + 2 + len);
+        buf.put_u64(self.last_accepted_conn_id);
+        buf.put_u16(u16::from(self.code));
+        buf.put_u16(len as u16);
+        buf.extend_from_slice(&bytes[..len]);
+        buf.freeze()
+    }
+
+    fn decode_payload(payload: &[u8]) -> Result<Self, ProtocolError> {
+        if payload.len() < 12 {
+            return Err(ProtocolError::Truncated);
+        }
+        let last_accepted_conn_id = u64::from_be_bytes(payload[..8].try_into().unwrap());
+        let code = ErrorCode::from(u16::from_be_bytes([payload[8], payload[9]]));
+        let len = u16::from_be_bytes([payload[10], payload[11]]) as usize;
+        if payload.len() < 12 + len {
+            return Err(ProtocolError::Truncated);
+        }
+        let reason = std::str::from_utf8(&payload[12..12 + len])
+            .map_err(|_| ProtocolError::InvalidUtf8)?
+            .to_string();
+        Ok(Self {
+            last_accepted_conn_id,
+            code,
+            reason,
+        })
+    }
+}
+
+impl GoAway {
+    pub fn new(last_accepted_conn_id: u64, code: ErrorCode, reason: impl Into<String>) -> Self {
+        Self {
+            last_accepted_conn_id,
+            code,
+            reason: reason.into(),
+        }
+    }
+}
+
+/// Bind a freshly-opened TCP connection to an existing mux session.
+///
+/// After the first lane completes the regular `Register`/`RegisterAck`
+/// handshake the client opens additional TCP connections (lanes
+/// `1..granted_lanes`) and sends `LaneHello` as the first frame. The
+/// server matches `session_token` to the in-memory mux entry and
+/// attaches the new lane.
+///
+/// Wire layout:
+///   u64 session_token
+///   u8  lane_idx
+///   u8  lane_total
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LaneHello {
+    pub session_token: u64,
+    pub lane_idx: u8,
+    pub lane_total: u8,
+}
+
+impl Message for LaneHello {
+    const MSG_TYPE: MessageType = MessageType::LaneHello;
+
+    fn encode_payload(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(8 + 1 + 1);
+        buf.put_u64(self.session_token);
+        buf.put_u8(self.lane_idx);
+        buf.put_u8(self.lane_total);
+        buf.freeze()
+    }
+
+    fn decode_payload(payload: &[u8]) -> Result<Self, ProtocolError> {
+        if payload.len() < 10 {
+            return Err(ProtocolError::Truncated);
+        }
+        let session_token = u64::from_be_bytes(payload[..8].try_into().unwrap());
+        let lane_idx = payload[8];
+        let lane_total = payload[9];
+        Ok(Self {
+            session_token,
+            lane_idx,
+            lane_total,
+        })
+    }
+}
+
+impl LaneHello {
+    pub fn new(session_token: u64, lane_idx: u8, lane_total: u8) -> Self {
+        Self {
+            session_token,
+            lane_idx,
+            lane_total,
+        }
     }
 }
 
@@ -363,6 +626,11 @@ pub enum ErrorCode {
     Timeout,
     ProtocolError,
     InternalError,
+    /// Authentication failed (bad client key, deleted entry, etc).
+    /// Distinct from [`ConnectionRefused`] so the client can stop
+    /// retrying instead of looping with backoff against a server
+    /// that will never accept it.
+    AuthFailed,
     Unknown(u16),
 }
 
@@ -375,6 +643,7 @@ impl From<u16> for ErrorCode {
             0x04 => Self::Timeout,
             0x05 => Self::ProtocolError,
             0x06 => Self::InternalError,
+            0x07 => Self::AuthFailed,
             other => Self::Unknown(other),
         }
     }
@@ -389,6 +658,7 @@ impl From<ErrorCode> for u16 {
             ErrorCode::Timeout => 0x04,
             ErrorCode::ProtocolError => 0x05,
             ErrorCode::InternalError => 0x06,
+            ErrorCode::AuthFailed => 0x07,
             ErrorCode::Unknown(v) => v,
         }
     }
@@ -485,17 +755,29 @@ impl FrameBuilder {
 // ============================================================================
 
 impl Register {
+    /// Build a `Register` with the protocol defaults for the mux
+    /// negotiation block (lanes / max_frame_size / initial_window).
+    /// Use the struct literal directly to override.
     pub fn new(key: impl Into<String>, http_proxy_port: Option<u16>) -> Self {
         Self {
             key: key.into(),
             http_proxy_port,
+            requested_lanes: DEFAULT_LANES,
+            max_frame_size: DEFAULT_MAX_FRAME_SIZE,
+            initial_window: DEFAULT_INITIAL_WINDOW,
         }
     }
 }
 
 impl RegisterAck {
     pub fn new(client_id: u64) -> Self {
-        Self { client_id }
+        Self {
+            client_id,
+            session_token: 0,
+            granted_lanes: 1,
+            max_frame_size: DEFAULT_MAX_FRAME_SIZE,
+            initial_window: DEFAULT_INITIAL_WINDOW,
+        }
     }
 }
 
@@ -557,6 +839,40 @@ mod tests {
         let decoded = Register::from_frame(&frame).unwrap();
         assert_eq!(decoded.http_proxy_port, None);
         assert_eq!(decoded.key, "client-key");
+        assert_eq!(decoded.requested_lanes, DEFAULT_LANES);
+        assert_eq!(decoded.max_frame_size, DEFAULT_MAX_FRAME_SIZE);
+        assert_eq!(decoded.initial_window, DEFAULT_INITIAL_WINDOW);
+    }
+
+    #[test]
+    fn test_register_custom_negotiation() {
+        let msg = Register {
+            key: "abc".into(),
+            http_proxy_port: None,
+            requested_lanes: 8,
+            max_frame_size: 4096,
+            initial_window: 64 * 1024,
+        };
+        let frame = msg.to_frame(0);
+        let decoded = Register::from_frame(&frame).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn test_register_legacy_minimal_payload_uses_defaults() {
+        // Old-style payload without the v3 negotiation tail. The decoder
+        // should treat missing bytes as "use default" rather than
+        // erroring, so test fixtures can keep handcrafting minimal
+        // payloads.
+        let mut p = BytesMut::new();
+        p.put_u16(0u16);
+        p.put_u16(3u16);
+        p.extend_from_slice(b"key");
+        let decoded = Register::decode_payload(&p).unwrap();
+        assert_eq!(decoded.key, "key");
+        assert_eq!(decoded.requested_lanes, 0);
+        assert_eq!(decoded.max_frame_size, 0);
+        assert_eq!(decoded.initial_window, 0);
     }
 
     #[test]
@@ -570,9 +886,59 @@ mod tests {
 
     #[test]
     fn test_register_ack_roundtrip() {
-        let msg = RegisterAck::new(12345);
+        let msg = RegisterAck {
+            client_id: 12345,
+            session_token: 9876,
+            granted_lanes: 4,
+            max_frame_size: 8192,
+            initial_window: 128 * 1024,
+        };
         let frame = msg.to_frame(0);
         let decoded = RegisterAck::from_frame(&frame).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn test_register_ack_legacy_minimal_payload_uses_defaults() {
+        let mut p = BytesMut::new();
+        p.put_u64(7);
+        let decoded = RegisterAck::decode_payload(&p).unwrap();
+        assert_eq!(decoded.client_id, 7);
+        assert_eq!(decoded.session_token, 0);
+        assert_eq!(decoded.granted_lanes, 1);
+        assert_eq!(decoded.max_frame_size, DEFAULT_MAX_FRAME_SIZE);
+        assert_eq!(decoded.initial_window, DEFAULT_INITIAL_WINDOW);
+    }
+
+    #[test]
+    fn test_window_update_roundtrip() {
+        let msg = WindowUpdate::new(65536);
+        let frame = msg.to_frame(42);
+        assert_eq!(frame.conn_id, 42);
+        let decoded = WindowUpdate::from_frame(&frame).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn test_window_update_truncated() {
+        let p = [0u8, 0, 0]; // need 4 bytes
+        let err = WindowUpdate::decode_payload(&p).unwrap_err();
+        assert!(matches!(err, ProtocolError::Truncated));
+    }
+
+    #[test]
+    fn test_goaway_roundtrip() {
+        let msg = GoAway::new(99, ErrorCode::ProtocolError, "bye");
+        let frame = msg.to_frame(0);
+        let decoded = GoAway::from_frame(&frame).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn test_lane_hello_roundtrip() {
+        let msg = LaneHello::new(0xdead_beef_cafe, 2, 4);
+        let frame = msg.to_frame(0);
+        let decoded = LaneHello::from_frame(&frame).unwrap();
         assert_eq!(msg, decoded);
     }
 

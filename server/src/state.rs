@@ -18,22 +18,29 @@
 //! all at once.
 
 use crate::auth::AuthService;
+use crate::oidc::OidcState;
 use crate::directory::ClientDirectory;
 use crate::listener::ListenerHandle;
 use crate::ratelimit::LoginRateLimiter;
 use crate::registry::{ClientRegistry, StoredMappingJson};
 use crate::session::{SessionConfig, SessionManager};
-use anno_common::{Frame, Host, Protocol, TargetAddress};
+use anno_common::mux::{CreditMap, MuxSender, Reassembler};
+use anno_common::{
+    Host, Protocol, TargetAddress, DEFAULT_INITIAL_WINDOW, DEFAULT_LANES,
+    DEFAULT_MAX_FRAME_SIZE,
+};
 use dashmap::DashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
-use tokio::sync::{mpsc, Mutex, OwnedMutexGuard};
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio_util::sync::CancellationToken;
 
-pub use crate::directory::{stored_to_port_mapping, ClientRecord, OnlineSession, StoredMapping};
+pub use crate::directory::{
+    stored_to_port_mapping, ClientRecord, OnlineSession, SessionMuxParams, StoredMapping,
+};
 
 /// Global monotonic connection id for multiplexed sessions.
 static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
@@ -103,6 +110,48 @@ pub fn stored_mapping_from_json(j: &StoredMappingJson) -> Option<StoredMapping> 
     })
 }
 
+/// Mux defaults the server uses when negotiating with `Register`.
+/// Each value is the server-side ceiling: the actual session uses
+/// `min(client_request, server_default)`.
+#[derive(Debug, Clone, Copy)]
+pub struct MuxDefaults {
+    pub max_lanes: u8,
+    pub max_frame_size: u16,
+    pub initial_window: u32,
+    /// Bytes the per-stream reassembler is allowed to hold before the
+    /// stream is forcefully closed.
+    pub reassembly_inflight_cap: usize,
+    /// Per-stream reassembly deadline.
+    pub reassembly_deadline: Duration,
+    /// After sending GoAway the server stops accepting new public
+    /// connections for this client and waits up to `goaway_grace` for
+    /// already-bridged sessions to drain. When the timer expires it
+    /// hard-cancels everything.
+    pub goaway_grace: Duration,
+}
+
+impl Default for MuxDefaults {
+    fn default() -> Self {
+        Self {
+            max_lanes: DEFAULT_LANES,
+            max_frame_size: DEFAULT_MAX_FRAME_SIZE,
+            initial_window: DEFAULT_INITIAL_WINDOW,
+            reassembly_inflight_cap: 1024 * 1024,
+            reassembly_deadline: Duration::from_secs(5),
+            goaway_grace: Duration::from_secs(5),
+        }
+    }
+}
+
+/// Admin UI authentication mode (password vs OIDC vs open).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthModeKind {
+    None,
+    Password,
+    Oidc,
+}
+
 /// Startup configuration.
 #[derive(Debug, Clone)]
 pub struct AppConfig {
@@ -128,6 +177,22 @@ pub struct AppConfig {
     /// dashboard so operators can copy the `host:port` their clients
     /// should connect to.
     pub control_addr: SocketAddr,
+    /// Multiplexer defaults negotiated against the client's `Register`.
+    pub mux: MuxDefaults,
+    /// How the management UI authenticates (`none` / `password` / `oidc`).
+    pub auth_mode: AuthModeKind,
+    /// Override for the listener actor's command-channel capacity.
+    /// `None` falls back to
+    /// `crate::listener::DEFAULT_COMMAND_CHANNEL_CAPACITY`. Bump
+    /// when massive registry-deletion bursts saturate the default.
+    pub listener_command_capacity: Option<usize>,
+    /// Process-wide upper bound on total bytes buffered by every
+    /// per-session [`anno_common::Reassembler`] combined. `0` means
+    /// "unlimited" (only per-stream caps apply). Defaults to 256
+    /// MiB — generous for normal traffic but stops a malicious peer
+    /// from spreading MORE-fragmented streams across many sessions
+    /// to exhaust server memory.
+    pub reassembly_global_cap: usize,
 }
 
 impl Default for AppConfig {
@@ -144,6 +209,10 @@ impl Default for AppConfig {
             register_timeout: Duration::from_secs(10),
             public_bind: IpAddr::from_str("0.0.0.0").unwrap(),
             control_addr: SocketAddr::from_str("0.0.0.0:9000").unwrap(),
+            mux: MuxDefaults::default(),
+            auth_mode: AuthModeKind::None,
+            listener_command_capacity: None,
+            reassembly_global_cap: 256 * 1024 * 1024,
         }
     }
 }
@@ -185,6 +254,8 @@ pub struct AppState {
 
 struct AppStateInner {
     config: AppConfig,
+    /// Present when `auth_mode == Oidc`; holds OIDC client + pending CSRF/PKCE state.
+    oidc: Option<Arc<OidcState>>,
     directory: ClientDirectory,
     listeners: DashMap<u16, ListenerRecord>,
     listeners_handle: ListenerHandle,
@@ -200,19 +271,26 @@ struct AppStateInner {
     /// runtime record with no way for the admin to authenticate it later.
     register_locks: DashMap<String, Arc<Mutex<()>>>,
     login_rate_limiter: LoginRateLimiter,
+    /// Process-wide reassembly memory cap shared by every per-session
+    /// [`anno_common::Reassembler`]. See
+    /// [`AppConfig::reassembly_global_cap`].
+    reassembly_budget: Arc<anno_common::ReassemblyBudget>,
 }
 
 impl AppState {
     pub fn with_config_and_registry(
         config: AppConfig,
+        oidc: Option<Arc<OidcState>>,
         registry: ClientRegistry,
         listeners_handle: ListenerHandle,
     ) -> Self {
         let session_manager = Arc::new(SessionManager::with_config(config.session.clone()));
-        let auth = AuthService::new(config.admin_password_hash.clone());
+        let auth = AuthService::new(config.auth_mode, config.admin_password_hash.clone());
+        let reassembly_budget = anno_common::ReassemblyBudget::new(config.reassembly_global_cap);
         Self {
             inner: Arc::new(AppStateInner {
                 config,
+                oidc,
                 directory: ClientDirectory::new(),
                 listeners: DashMap::new(),
                 listeners_handle,
@@ -222,8 +300,13 @@ impl AppState {
                 client_write_locks: DashMap::new(),
                 register_locks: DashMap::new(),
                 login_rate_limiter: LoginRateLimiter::new(),
+                reassembly_budget,
             }),
         }
+    }
+
+    pub fn reassembly_budget(&self) -> &Arc<anno_common::ReassemblyBudget> {
+        &self.inner.reassembly_budget
     }
 
     // ------------------------------------------------------------------
@@ -232,6 +315,10 @@ impl AppState {
 
     pub fn config(&self) -> &AppConfig {
         &self.inner.config
+    }
+
+    pub fn oidc(&self) -> Option<&Arc<OidcState>> {
+        self.inner.oidc.as_ref()
     }
 
     #[allow(dead_code)]
@@ -321,15 +408,43 @@ impl AppState {
             .clear_online_if_owner(client_id, expected_token)
     }
 
-    pub fn client_tx(&self, client_id: u64) -> Option<mpsc::Sender<Frame>> {
+    pub fn client_tx(&self, client_id: u64) -> Option<MuxSender> {
         self.inner.directory.client_tx(client_id)
     }
 
     pub fn client_tx_and_cancel(
         &self,
         client_id: u64,
-    ) -> Option<(mpsc::Sender<Frame>, CancellationToken)> {
+    ) -> Option<(MuxSender, CancellationToken)> {
         self.inner.directory.client_tx_and_cancel(client_id)
+    }
+
+    #[allow(dead_code)]
+    pub fn client_reassembler(&self, client_id: u64) -> Option<Arc<StdMutex<Reassembler>>> {
+        self.inner.directory.client_reassembler(client_id)
+    }
+
+    pub fn client_mux_params(&self, client_id: u64) -> Option<SessionMuxParams> {
+        self.inner.directory.client_mux_params(client_id)
+    }
+
+    pub fn client_credit_map(&self, client_id: u64) -> Option<Arc<CreditMap>> {
+        self.inner.directory.client_credit_map(client_id)
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub fn lookup_by_session_token(
+        &self,
+        session_token: u64,
+    ) -> Option<(
+        u64,
+        MuxSender,
+        CancellationToken,
+        SessionMuxParams,
+        Arc<StdMutex<Reassembler>>,
+        Arc<CreditMap>,
+    )> {
+        self.inner.directory.lookup_by_session_token(session_token)
     }
 
     // ------------------------------------------------------------------

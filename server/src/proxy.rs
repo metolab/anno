@@ -19,8 +19,10 @@
 
 use crate::session::{ConnReadyError, SessionManager, SessionProtocol};
 use crate::state::{next_conn_id, AppState, StoredMapping};
+use anno_common::mux::{CreditMap, FrameShard};
 use anno_common::{
-    ConnClose, ConnProtocol, DataTcp, DataUdp, Host, Message, NewConn, Protocol, TargetAddress,
+    ConnClose, ConnProtocol, DataUdp, Host, Message, MessageType, NewConn, Protocol, TargetAddress,
+    DEFAULT_MAX_FRAME_SIZE,
 };
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -28,6 +30,7 @@ use socket2::{Domain, Protocol as S2Proto, Socket, Type};
 use std::collections::VecDeque;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::oneshot;
@@ -287,12 +290,25 @@ async fn handle_tcp_incoming(
     let sm_up = Arc::clone(session_manager);
     let session_up = Arc::clone(&session);
     let cancel_up = cancel.clone();
+    // Use the negotiated `max_frame_size` (per-client) when sharding
+    // outbound DataTcp; falling back to the protocol default if the
+    // client is somehow no longer in the directory by the time we
+    // start the up task.
+    let frame_cap = state
+        .client_mux_params(client_id)
+        .map(|p| p.max_frame_size as usize)
+        .unwrap_or(DEFAULT_MAX_FRAME_SIZE as usize);
+    // Per-stream send credit. The server is the *sender* here so it
+    // must respect the window the client granted us via WindowUpdates.
+    let credit_map_up: Option<Arc<CreditMap>> = state.client_credit_map(client_id);
     let up = tokio::spawn(async move {
-        // Cap per-read size to 65535 (< u16::MAX) so the resulting frame
-        // payload length always fits in the 2-byte length field in the
-        // frame header. Without this cap a 65536-byte read would silently
-        // overflow to 0 in `encode_frame` and corrupt the stream.
-        let mut buf = vec![0u8; 65535];
+        // Read at most one frame's worth at a time so each TCP read
+        // typically becomes exactly one shard. The sharder still wraps
+        // the result for safety in case a future code path produces a
+        // larger payload. `frame_cap` is bounded by `MIN_MAX_FRAME_SIZE`
+        // (1 KiB) on negotiation so this is always a sane size.
+        let buf_size = frame_cap.max(1024);
+        let mut buf = vec![0u8; buf_size];
         loop {
             let n = tokio::select! {
                 biased;
@@ -304,9 +320,52 @@ async fn handle_tcp_incoming(
             };
             session_up.stats.record_up(n);
             let chunk = Bytes::copy_from_slice(&buf[..n]);
-            let fr = DataTcp::new(chunk).to_frame(conn_id);
-            if to_client.send(fr).await.is_err() {
-                tracing::warn!(conn_id, "to_client send failed (client control channel closed)");
+            let mut sender_failed = false;
+            for shard in
+                FrameShard::new(MessageType::DataTcp, conn_id, chunk, frame_cap)
+            {
+                let shard_len = shard.payload.len();
+                metrics::counter!("mux_shards_total", "side" => "server", "dir" => "tx")
+                    .increment(1);
+                if let Some(cm) = credit_map_up.as_ref() {
+                    let credit = cm.get_or_create(conn_id);
+                    let t0 = std::time::Instant::now();
+                    let acquired = tokio::select! {
+                        biased;
+                        _ = cancel_up.cancelled() => {
+                            sender_failed = true;
+                            break;
+                        }
+                        r = credit.acquire_send(shard_len) => r,
+                    };
+                    if acquired.is_err() {
+                        sender_failed = true;
+                        break;
+                    }
+                    let waited = t0.elapsed().as_secs_f64();
+                    if waited > 0.001 {
+                        metrics::histogram!("mux_credit_wait_seconds", "side" => "server")
+                            .record(waited);
+                    }
+                }
+                let send_res = tokio::select! {
+                    biased;
+                    _ = cancel_up.cancelled() => {
+                        sender_failed = true;
+                        break;
+                    }
+                    r = to_client.send(shard) => r,
+                };
+                if send_res.is_err() {
+                    tracing::warn!(
+                        conn_id,
+                        "to_client send failed (client control channel closed)"
+                    );
+                    sender_failed = true;
+                    break;
+                }
+            }
+            if sender_failed {
                 break;
             }
         }
@@ -353,6 +412,12 @@ enum PeerState {
         conn_id: u64,
         buf: VecDeque<Bytes>,
         buf_bytes: usize,
+        /// When the handshake started. The recv loop sweeps any
+        /// entry whose age exceeds `2 * conn_ready_timeout` so a
+        /// crashed handshake task or a peer that stopped sending
+        /// after the first packet cannot pin a `Pending` slot
+        /// (and its buffered packets) forever.
+        created_at: Instant,
     },
     Active {
         conn_id: u64,
@@ -386,19 +451,60 @@ async fn run_udp(
     let peer_sessions: Arc<DashMap<SocketAddr, PeerState>> = Arc::new(DashMap::new());
     let mut buf = vec![0u8; 64 * 1024];
     let mut recv_backoff_ms: u64 = 1;
+    // Sweep stale `Pending` entries (peers whose handshake never
+    // finished) so they don't pin memory forever. The cap is
+    // generous — `conn_ready_timeout * 2` — because the per-handshake
+    // task already has its own timeout; this is a defense against
+    // panics or future code paths that bypass it.
+    let pending_max_age = conn_ready_timeout.saturating_mul(2);
+    let mut sweep_ticker = tokio::time::interval(std::time::Duration::from_secs(2));
+    sweep_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    sweep_ticker.tick().await;
 
     loop {
-        let (n, peer) = match sock.recv_from(&mut buf).await {
-            Ok(x) => {
-                recv_backoff_ms = 1;
-                x
-            }
-            Err(e) => {
-                tracing::error!("udp recv: {}", e);
-                tokio::time::sleep(std::time::Duration::from_millis(recv_backoff_ms)).await;
-                recv_backoff_ms = (recv_backoff_ms * 2).min(1000);
+        let (n, peer) = tokio::select! {
+            biased;
+            _ = sweep_ticker.tick() => {
+                let now = Instant::now();
+                peer_sessions.retain(|peer, st| match st {
+                    PeerState::Pending { created_at, conn_id, .. } => {
+                        if now.duration_since(*created_at) > pending_max_age {
+                            tracing::debug!(
+                                %peer,
+                                conn_id = *conn_id,
+                                age_secs = now.duration_since(*created_at).as_secs(),
+                                "evicting stale UDP Pending entry"
+                            );
+                            // Best-effort: also drop any session row
+                            // the handshake task may have left
+                            // behind so we don't leak it either.
+                            session_manager.remove(*conn_id);
+                            metrics::counter!(
+                                "udp_pending_evicted_total",
+                                "side" => "server"
+                            )
+                            .increment(1);
+                            false
+                        } else {
+                            true
+                        }
+                    }
+                    PeerState::Active { .. } => true,
+                });
                 continue;
             }
+            r = sock.recv_from(&mut buf) => match r {
+                Ok(x) => {
+                    recv_backoff_ms = 1;
+                    x
+                }
+                Err(e) => {
+                    tracing::error!("udp recv: {}", e);
+                    tokio::time::sleep(std::time::Duration::from_millis(recv_backoff_ms)).await;
+                    recv_backoff_ms = (recv_backoff_ms * 2).min(1000);
+                    continue;
+                }
+            },
         };
         let payload = Bytes::copy_from_slice(&buf[..n]);
 
@@ -548,6 +654,7 @@ async fn start_udp_peer_handshake(
             conn_id,
             buf: initial_buf,
             buf_bytes: n,
+            created_at: Instant::now(),
         },
     );
 

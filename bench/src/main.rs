@@ -132,6 +132,52 @@ enum Commands {
         #[arg(long, default_value_t = 1)]
         sample_interval_secs: u64,
     },
+    /// End-to-end echo of a payload that spans multiple mux shards.
+    /// Verifies the FrameShard + Reassembler path in real binaries.
+    LargePacket {
+        /// Single TCP write/read size in bytes. Should be larger than the
+        /// negotiated `max_frame_size` (16 KiB by default) so the
+        /// payload is guaranteed to fragment.
+        #[arg(long, default_value_t = 256 * 1024)]
+        payload: usize,
+    },
+    /// Two concurrent streams compete for the same lane. Reports per-
+    /// stream throughput and the slow/fast ratio so we can assert the
+    /// scheduler + credit windowing keep them balanced.
+    Fairness {
+        #[arg(long, default_value_t = 256 * 1024)]
+        payload: usize,
+        #[arg(long, default_value_t = 32)]
+        rounds: usize,
+    },
+    /// Head-of-line blocking repro: time short probes against a busy
+    /// hammer stream and report the p99 inflation. With multi-lane +
+    /// scheduler + credit windowing this should stay close to 1x.
+    Hol {
+        /// Per-iteration write size for the hammer stream.
+        #[arg(long, default_value_t = 64 * 1024)]
+        payload: usize,
+        /// Number of 64-byte probe round-trips to time in each phase.
+        #[arg(long, default_value_t = 200)]
+        probes: usize,
+        /// Wall-clock seconds to keep the hammer running.
+        #[arg(long, default_value_t = 3)]
+        hammer_secs: u64,
+    },
+    /// Window saturation: write to a slow-draining peer and check that
+    /// the per-stream credit window throttles the writer (max chunk
+    /// latency reflects the receiver pause).
+    WindowSat {
+        /// Total bytes written across the test.
+        #[arg(long, default_value_t = 4 * 1024 * 1024)]
+        total: usize,
+        /// Per-write chunk size.
+        #[arg(long, default_value_t = 16 * 1024)]
+        chunk: usize,
+        /// How long the receiver refuses to read after accept.
+        #[arg(long, default_value_t = 800)]
+        pause_ms: u64,
+    },
 }
 
 #[tokio::main]
@@ -263,6 +309,20 @@ async fn main() -> Result<()> {
             )
             .await?
         }
+        Commands::LargePacket { payload } => tests::large_packet::run(&harness, payload).await?,
+        Commands::Fairness { payload, rounds } => {
+            tests::fairness::run(&harness, payload, rounds).await?
+        }
+        Commands::Hol {
+            payload,
+            probes,
+            hammer_secs,
+        } => tests::hol::run(&harness, payload, probes, hammer_secs).await?,
+        Commands::WindowSat {
+            total,
+            chunk,
+            pause_ms,
+        } => tests::window_saturation::run(&harness, total, chunk, pause_ms).await?,
     };
 
     harness.teardown();

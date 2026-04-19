@@ -1,6 +1,6 @@
 import { Card, Col, Row, Statistic, Typography } from "antd";
 import { useEffect, useState } from "react";
-import { fetchStats, StatsDto } from "../api";
+import { fetchStats, formatBytes, StatsDto } from "../api";
 
 export default function DashboardPage() {
   const [stats, setStats] = useState<StatsDto | null>(null);
@@ -104,11 +104,4 @@ export default function DashboardPage() {
       </Row>
     </div>
   );
-}
-
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
-  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }

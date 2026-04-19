@@ -13,7 +13,7 @@
 | `frontend`    | React + Ant Design 管理界面（Vite） |
 
 
-控制面二进制帧由 `common` 定义，**帧版本为 v2**（`VERSION = 0x02`）。请**同版本**构建并部署 `anno-server` 与 `anno-client`，否则将因版本不匹配无法建立控制连接。
+控制面二进制帧由 `common` 定义，**帧版本为 v4**（`VERSION = 0x04`）。请**同版本**构建并部署 `anno-server` 与 `anno-client`，否则将因版本不匹配无法建立控制连接。v4 在 v3 的基础上新增：客户端发起的 GoAway 处理、独立的 `ErrorCode::AuthFailed`、帧头 `features` bitmap（保留供后续扩展）。
 
 ---
 

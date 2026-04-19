@@ -3,6 +3,7 @@ mod forward;
 mod http_proxy;
 mod reconnect;
 
+use anno_common::{DEFAULT_INITIAL_WINDOW, DEFAULT_LANES, DEFAULT_MAX_FRAME_SIZE};
 use clap::Parser;
 use connection::ClientConfig;
 use reconnect::{Backoff, SessionError};
@@ -55,6 +56,21 @@ struct Args {
     /// forwarding a TCP frame. On timeout the session is torn down.
     #[arg(long, default_value_t = 5)]
     tcp_send_timeout_secs: u64,
+
+    /// Number of physical TCP lanes the client wants for this mux session.
+    /// The server may grant fewer. Default matches `anno_common::DEFAULT_LANES`.
+    #[arg(long, default_value_t = DEFAULT_LANES)]
+    lanes: u8,
+
+    /// Largest single shard the client is willing to send/accept on the
+    /// wire. Default matches `anno_common::DEFAULT_MAX_FRAME_SIZE` (16 KiB).
+    #[arg(long, default_value_t = DEFAULT_MAX_FRAME_SIZE)]
+    max_frame_size: u16,
+
+    /// Initial per-stream credit window (bytes) requested in `Register`.
+    /// Default matches `anno_common::DEFAULT_INITIAL_WINDOW`.
+    #[arg(long, default_value_t = DEFAULT_INITIAL_WINDOW)]
+    initial_window: u32,
 }
 
 #[tokio::main]
@@ -103,6 +119,9 @@ async fn main() {
         ping_interval: Duration::from_secs(args.ping_interval_secs),
         idle_timeout: Duration::from_secs(args.idle_timeout_secs),
         tcp_send_timeout: Duration::from_secs(args.tcp_send_timeout_secs),
+        requested_lanes: args.lanes,
+        max_frame_size: args.max_frame_size,
+        initial_window: args.initial_window,
     };
 
     tracing::info!(

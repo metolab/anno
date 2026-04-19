@@ -77,3 +77,28 @@ pub async fn run_tcp_discard(addr: SocketAddr) -> Result<()> {
         });
     }
 }
+
+/// TCP "slow drain": for every accepted connection, do NOT read the
+/// socket for `pause` and then drain at full speed. Used by the
+/// window-saturation bench to confirm the sender's credit window
+/// stalls forwarding when the receiver isn't consuming.
+pub async fn run_tcp_slow_drain(addr: SocketAddr, pause: std::time::Duration) -> Result<()> {
+    let listener = TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("bind tcp slow-drain {addr}"))?;
+    tracing::info!("tcp slow-drain listening on {} (pause={:?})", addr, pause);
+    loop {
+        let mut stream = listener.accept().await?.0;
+        tokio::spawn(async move {
+            tokio::time::sleep(pause).await;
+            let mut buf = vec![0u8; 65536];
+            loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+}

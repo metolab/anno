@@ -30,6 +30,7 @@ import {
   disconnectClient,
   fetchClients,
   fetchRegistry,
+  formatBytes,
   regenerateRegistryKey,
   updateRegistryEntry,
   type ClientDto,
@@ -124,6 +125,13 @@ export default function ClientsPage() {
 
   useEffect(() => {
     void reload();
+    // Per-mapping traffic counters need periodic refresh to be useful;
+    // align with the Dashboard's polling cadence (5s here, finer-grained
+    // than the dashboard so traffic feels live in the mapping table).
+    const timer = setInterval(() => {
+      void reload();
+    }, 5_000);
+    return () => clearInterval(timer);
   }, [reload]);
 
   const copyToClipboard = (text: string) => {
@@ -376,6 +384,18 @@ export default function ClientsPage() {
       { title: "服务端端口", dataIndex: "server_port", width: 140 },
       { title: "协议", dataIndex: "protocol", width: 100 },
       { title: "目标", dataIndex: "target" },
+      {
+        title: "上行",
+        dataIndex: "bytes_up",
+        width: 110,
+        render: (n: number) => formatBytes(n),
+      },
+      {
+        title: "下行",
+        dataIndex: "bytes_down",
+        width: 110,
+        render: (n: number) => formatBytes(n),
+      },
       {
         title: "活动会话",
         dataIndex: "active_connections",

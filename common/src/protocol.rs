@@ -15,7 +15,42 @@ use tokio_util::codec::{Decoder, Encoder};
 
 pub const FRAME_HEADER_SIZE: usize = 16;
 pub const MAGIC: u16 = 0x4E54;
-pub const VERSION: u8 = 0x02;
+/// Wire protocol version. Bumped to `0x04` for the
+/// "active-teardown / GoAway-from-client / AuthFailed" wave; older
+/// peers (`0x03`) are rejected at decode time so we never have to
+/// keep two divergent code paths alive in parallel.
+pub const VERSION: u8 = 0x04;
+
+/// Frame header `flags` byte bits. Multiple bits may be set on the same
+/// frame (e.g. the last shard of a TCP write also marks `FIN` when the
+/// stream is closing).
+pub mod flags {
+    /// Last frame for this `conn_id` (logical half-close).
+    pub const FIN: u8 = 0b0000_0001;
+    /// Frame opens a new stream (reserved for future 0-RTT path).
+    pub const SYN: u8 = 0b0000_0010;
+    /// Another shard of the same logical payload follows immediately.
+    /// Used by the application-level fragmentation in [`crate::mux`].
+    pub const MORE: u8 = 0b0000_0100;
+}
+
+/// Reserved per-frame **features bitmap** (header byte 5). The byte
+/// has been zero on the wire ever since `0x03`; bumping to `0x04`
+/// lets us start using it without a breaking change later. For now
+/// every frame is encoded with `features = 0` and the decoder only
+/// validates that no unknown bit is set so a future feature can be
+/// rolled out unilaterally without re-bumping the version. Add new
+/// flags below and OR them into [`KNOWN_MASK`].
+pub mod features {
+    /// No features active — current default for every emitted frame.
+    pub const NONE: u8 = 0x00;
+    /// Mask of bits the current implementation understands. Any bit
+    /// outside this mask in a received frame is treated as a
+    /// protocol error so a peer that rolls out a new feature
+    /// incompatibly at least gets a loud failure instead of silent
+    /// misinterpretation.
+    pub const KNOWN_MASK: u8 = NONE;
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -26,6 +61,15 @@ pub enum MessageType {
     RegisterAck = 0x03,
     ConfigPush = 0x04,
     ConfigAck = 0x05,
+    /// Per-stream credit-based flow control update (`0x06`).
+    /// `frame.conn_id == 0` is reserved for future connection-wide window.
+    WindowUpdate = 0x06,
+    /// Graceful-shutdown notification (`0x07`). After receipt the peer
+    /// should not start any new streams; in-flight ones may finish.
+    GoAway = 0x07,
+    /// Bind a freshly-opened TCP connection to an already-registered
+    /// client session (`0x08`). Used by the client-side N-lane mux pool.
+    LaneHello = 0x08,
     NewConn = 0x20,
     ConnReady = 0x21,
     ConnClose = 0x22,
@@ -46,6 +90,9 @@ impl TryFrom<u8> for MessageType {
             0x03 => Ok(Self::RegisterAck),
             0x04 => Ok(Self::ConfigPush),
             0x05 => Ok(Self::ConfigAck),
+            0x06 => Ok(Self::WindowUpdate),
+            0x07 => Ok(Self::GoAway),
+            0x08 => Ok(Self::LaneHello),
             0x20 => Ok(Self::NewConn),
             0x21 => Ok(Self::ConnReady),
             0x22 => Ok(Self::ConnClose),
@@ -284,6 +331,12 @@ pub enum ProtocolError {
     EmptyDomain,
     #[error("bad connection protocol {0}")]
     BadConnProtocol(u8),
+    /// Frame header carried bits in the `features` byte that this
+    /// peer does not understand. Treated as a fatal protocol error
+    /// rather than silently ignored so an incompatible feature
+    /// rollout fails loud.
+    #[error("unknown feature bits {0:#04x}")]
+    UnknownFeatures(u8),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -304,7 +357,10 @@ pub fn encode_frame(f: &Frame) -> BytesMut {
     buf.put_u8(VERSION);
     buf.put_u8(f.msg_type as u8);
     buf.put_u8(f.flags);
-    buf.put_u8(0);
+    // Header byte 5 — features bitmap. Always zero today (see
+    // `features::NONE`); reserved for future negotiation without
+    // having to re-bump VERSION.
+    buf.put_u8(features::NONE);
     buf.put_u16(payload_len as u16);
     buf.put_u64(f.conn_id);
     buf.extend_from_slice(&f.payload[..payload_len]);
@@ -328,7 +384,13 @@ pub fn decode_frame(src: &mut BytesMut) -> Result<Option<Frame>, ProtocolError> 
     let msg_type =
         MessageType::try_from(msg_type).map_err(|_| ProtocolError::BadMessageType(msg_type))?;
     let flags = src[4];
-    let _reserved = src[5];
+    // Header byte 5: per-frame features bitmap. Reject any bit
+    // outside `features::KNOWN_MASK` so an incompatible peer rollout
+    // fails loud instead of being silently misinterpreted.
+    let features_byte = src[5];
+    if features_byte & !features::KNOWN_MASK != 0 {
+        return Err(ProtocolError::UnknownFeatures(features_byte));
+    }
     let len = u16::from_be_bytes([src[6], src[7]]) as usize;
     let conn_id = u64::from_be_bytes([
         src[8], src[9], src[10], src[11], src[12], src[13], src[14], src[15],
@@ -554,9 +616,23 @@ mod tests {
     #[test]
     fn test_message_type_conversion() {
         assert_eq!(MessageType::try_from(0x00), Ok(MessageType::Ping));
+        assert_eq!(MessageType::try_from(0x06), Ok(MessageType::WindowUpdate));
+        assert_eq!(MessageType::try_from(0x07), Ok(MessageType::GoAway));
+        assert_eq!(MessageType::try_from(0x08), Ok(MessageType::LaneHello));
         assert_eq!(MessageType::try_from(0x40), Ok(MessageType::DataTcp));
         assert_eq!(MessageType::try_from(0xF0), Ok(MessageType::Fault));
         assert!(MessageType::try_from(0x99).is_err());
+    }
+
+    #[test]
+    fn test_flag_bits_are_disjoint() {
+        let f = flags::FIN | flags::SYN | flags::MORE;
+        assert_ne!(f & flags::FIN, 0);
+        assert_ne!(f & flags::SYN, 0);
+        assert_ne!(f & flags::MORE, 0);
+        assert_eq!(flags::FIN & flags::SYN, 0);
+        assert_eq!(flags::SYN & flags::MORE, 0);
+        assert_eq!(flags::FIN & flags::MORE, 0);
     }
 
     #[test]

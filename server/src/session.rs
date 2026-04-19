@@ -255,6 +255,16 @@ pub struct SessionManager {
     port_counts: DashMap<u16, AtomicUsize>,
     /// client_id -> active session count (O(1) lookup index).
     client_counts: DashMap<u64, AtomicUsize>,
+    /// client_id -> highest `conn_id` ever assigned to that client.
+    /// Bumped monotonically on every `create_session`. Lets
+    /// `max_conn_id_for_client` answer in O(1) instead of scanning
+    /// every active session — the previous implementation was
+    /// quadratic when GoAway storms hit a server with thousands of
+    /// active streams. The value is "highest ever assigned" rather
+    /// than "highest currently live", which matches the semantics
+    /// `GoAway::last_accepted_conn_id` actually wants (a hint about
+    /// which inbound NewConn frames have already been accepted).
+    client_max_conn_id: DashMap<u64, AtomicU64>,
     /// Statistics
     total_created: AtomicU64,
     total_closed: AtomicU64,
@@ -268,6 +278,15 @@ pub struct SessionManager {
     /// Cumulative `queue_drops` from closed sessions (same rationale as
     /// `lifetime_bytes_up`).
     lifetime_queue_drops: AtomicU64,
+    /// Per-mapping `(client_id, server_port)` cumulative byte counters.
+    /// Updated when a session is removed (its bytes are folded in here in
+    /// addition to the global `lifetime_*`). Combined with the live byte
+    /// counts of still-active sessions for that `(client, port)` to answer
+    /// `mapping_traffic`. Entries are dropped via `forget_mapping_traffic`
+    /// / `forget_client_mapping_traffic` so the maps don't grow without
+    /// bound across mapping/client deletions.
+    mapping_bytes_up: DashMap<(u64, u16), AtomicU64>,
+    mapping_bytes_down: DashMap<(u64, u16), AtomicU64>,
 }
 
 impl SessionManager {
@@ -282,11 +301,14 @@ impl SessionManager {
             conn_ready_waiters: DashMap::new(),
             port_counts: DashMap::new(),
             client_counts: DashMap::new(),
+            client_max_conn_id: DashMap::new(),
             total_created: AtomicU64::new(0),
             total_closed: AtomicU64::new(0),
             lifetime_bytes_up: AtomicU64::new(0),
             lifetime_bytes_down: AtomicU64::new(0),
             lifetime_queue_drops: AtomicU64::new(0),
+            mapping_bytes_up: DashMap::new(),
+            mapping_bytes_down: DashMap::new(),
         }
     }
 
@@ -321,6 +343,13 @@ impl SessionManager {
             .entry(client_id)
             .or_insert_with(|| AtomicUsize::new(0))
             .fetch_add(1, Ordering::Relaxed);
+        // Bump the monotonic max for this client. `fetch_max` keeps
+        // the value strictly non-decreasing under concurrent
+        // create_session calls.
+        self.client_max_conn_id
+            .entry(client_id)
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_max(conn_id, Ordering::Relaxed);
         metrics::counter!("sessions_created_total").increment(1);
         metrics::gauge!("sessions_active").increment(1.0);
         (session, rx)
@@ -345,18 +374,26 @@ impl SessionManager {
             // Fold the closed session's counters into the lifetime totals so
             // `aggregate_tunnel_stats` keeps reporting a monotonic cumulative
             // number even after the session is gone.
-            self.lifetime_bytes_up.fetch_add(
-                session.stats.bytes_up.load(Ordering::Relaxed),
-                Ordering::Relaxed,
-            );
-            self.lifetime_bytes_down.fetch_add(
-                session.stats.bytes_down.load(Ordering::Relaxed),
-                Ordering::Relaxed,
-            );
+            let up = session.stats.bytes_up.load(Ordering::Relaxed);
+            let down = session.stats.bytes_down.load(Ordering::Relaxed);
+            self.lifetime_bytes_up.fetch_add(up, Ordering::Relaxed);
+            self.lifetime_bytes_down.fetch_add(down, Ordering::Relaxed);
             self.lifetime_queue_drops.fetch_add(
                 session.stats.queue_drops.load(Ordering::Relaxed),
                 Ordering::Relaxed,
             );
+            // Per-mapping cumulative — same rationale as lifetime_*, but
+            // sliced by (client_id, server_port) so the API can show
+            // monotonic per-mapping totals.
+            let key = (session.client_id, session.server_port);
+            self.mapping_bytes_up
+                .entry(key)
+                .or_insert_with(|| AtomicU64::new(0))
+                .fetch_add(up, Ordering::Relaxed);
+            self.mapping_bytes_down
+                .entry(key)
+                .or_insert_with(|| AtomicU64::new(0))
+                .fetch_add(down, Ordering::Relaxed);
             if let Some(cnt) = self.port_counts.get(&session.server_port) {
                 cnt.fetch_sub(1, Ordering::Relaxed);
             }
@@ -387,8 +424,67 @@ impl SessionManager {
             .unwrap_or(0)
     }
 
+    /// Return cumulative `(bytes_up, bytes_down)` for the mapping
+    /// `(client_id, server_port)`. Combines the folded-in counters of
+    /// already-closed sessions with the live byte counts of any session
+    /// still active for that `(client, port)`. The number is monotonic
+    /// across session churn for the lifetime of the process; it resets
+    /// when the mapping or its owning client is removed (callers should
+    /// invoke `forget_mapping_traffic` / `forget_client_mapping_traffic`).
+    pub fn mapping_traffic(&self, client_id: u64, server_port: u16) -> (u64, u64) {
+        let ordering = Ordering::Relaxed;
+        let key = (client_id, server_port);
+        let mut up = self
+            .mapping_bytes_up
+            .get(&key)
+            .map(|c| c.load(ordering))
+            .unwrap_or(0);
+        let mut down = self
+            .mapping_bytes_down
+            .get(&key)
+            .map(|c| c.load(ordering))
+            .unwrap_or(0);
+        for entry in self.iter_sessions() {
+            let s = entry.value();
+            if s.client_id == client_id && s.server_port == server_port {
+                up = up.saturating_add(s.stats.bytes_up.load(ordering));
+                down = down.saturating_add(s.stats.bytes_down.load(ordering));
+            }
+        }
+        (up, down)
+    }
+
+    /// Drop the cumulative counters for a single mapping. Called when
+    /// the mapping is deleted so the maps don't grow without bound.
+    pub fn forget_mapping_traffic(&self, client_id: u64, server_port: u16) {
+        let key = (client_id, server_port);
+        self.mapping_bytes_up.remove(&key);
+        self.mapping_bytes_down.remove(&key);
+    }
+
+    /// Drop the cumulative counters for every mapping owned by `client_id`.
+    /// Called from the registry-delete cascade.
+    pub fn forget_client_mapping_traffic(&self, client_id: u64) {
+        self.mapping_bytes_up
+            .retain(|(cid, _), _| *cid != client_id);
+        self.mapping_bytes_down
+            .retain(|(cid, _), _| *cid != client_id);
+    }
+
     pub fn active_count(&self) -> usize {
         self.sessions.len()
+    }
+
+    /// Highest `conn_id` ever assigned to `client_id`, or 0 if the
+    /// server has never seen one. Backed by the per-client
+    /// `client_max_conn_id` map so this is O(1) instead of an O(N)
+    /// scan over every active session — important for `GoAway`
+    /// storms on busy servers.
+    pub fn max_conn_id_for_client(&self, client_id: u64) -> u64 {
+        self.client_max_conn_id
+            .get(&client_id)
+            .map(|c| c.load(Ordering::Relaxed))
+            .unwrap_or(0)
     }
 
     pub fn iter_sessions(&self) -> dashmap::iter::Iter<'_, u64, Arc<Session>> {
@@ -463,7 +559,9 @@ impl SessionManager {
         cleaned
     }
 
-    /// Remove all sessions for a client.
+    /// Remove all sessions for a client. Also drops the per-client
+    /// max-conn-id and counter entries so a re-registered client
+    /// starts fresh and the maps don't grow without bound.
     pub fn remove_client_sessions(&self, client_id: u64) -> usize {
         let to_remove: Vec<u64> = self
             .sessions
@@ -476,6 +574,11 @@ impl SessionManager {
         for conn_id in to_remove {
             self.remove(conn_id);
         }
+        // Tidy up per-client housekeeping. `client_counts` is left
+        // alone (it's an AtomicUsize that's already at zero after
+        // the per-conn `remove` calls). `client_max_conn_id` is
+        // dropped so the next registration starts from 0.
+        self.client_max_conn_id.remove(&client_id);
         count
     }
 

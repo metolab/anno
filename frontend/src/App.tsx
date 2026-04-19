@@ -1,4 +1,4 @@
-import { Layout, Menu, Button, theme } from "antd";
+import { Layout, Menu, Button, theme, Spin, Result } from "antd";
 import {
   CloudServerOutlined,
   DashboardOutlined,
@@ -19,7 +19,7 @@ function RequireAuth({ children }: { children: React.ReactNode }) {
 
 function AdminLayout() {
   const location = useLocation();
-  const { signOut } = useAuth();
+  const { signOut, authMode } = useAuth();
   const {
     token: { colorBgContainer, borderRadiusLG },
   } = theme.useToken();
@@ -67,13 +67,11 @@ function AdminLayout() {
           }}
         >
           <span style={{ fontSize: 16, fontWeight: 600 }}>anno</span>
-          <Button
-            type="text"
-            icon={<LogoutOutlined />}
-            onClick={signOut}
-          >
-            退出登录
-          </Button>
+          {authMode !== "none" && (
+            <Button type="text" icon={<LogoutOutlined />} onClick={signOut}>
+              退出登录
+            </Button>
+          )}
         </Header>
         <Content style={{ margin: 16 }}>
           <div
@@ -97,6 +95,49 @@ function AdminLayout() {
 }
 
 export default function App() {
+  const { isReady, configError, reloadConfig } = useAuth();
+
+  if (!isReady) {
+    return (
+      <div
+        style={{
+          display: "flex",
+          minHeight: "100vh",
+          alignItems: "center",
+          justifyContent: "center",
+          background: "#f0f2f5",
+        }}
+      >
+        <Spin size="large" />
+      </div>
+    );
+  }
+
+  if (configError) {
+    return (
+      <div
+        style={{
+          display: "flex",
+          minHeight: "100vh",
+          alignItems: "center",
+          justifyContent: "center",
+          background: "#f0f2f5",
+        }}
+      >
+        <Result
+          status="error"
+          title="无法加载认证配置"
+          subTitle={configError}
+          extra={
+            <Button type="primary" onClick={() => void reloadConfig()}>
+              重试
+            </Button>
+          }
+        />
+      </div>
+    );
+  }
+
   return (
     <Routes>
       <Route path="/login" element={<LoginPage />} />

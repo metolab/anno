@@ -32,3 +32,5 @@ dotenvy = "0.15"
 uuid = { version = "1.8", features = ["v4"] }
 rust-embed = { version = "8", features = ["mime-guess"] }
 mime_guess = "2.0"
+openidconnect = { version = "4.0.1", default-features = false, features = ["reqwest", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

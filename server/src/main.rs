@@ -4,16 +4,20 @@ mod control;
 mod directory;
 mod frontend;
 mod listener;
+mod oidc;
 mod proxy;
 mod ratelimit;
 mod registry;
 mod session;
 mod state;
 
-use crate::listener::{make_handle, spawn_listener_actor};
+use crate::listener::{make_handle_with_capacity, spawn_listener_actor};
 use crate::registry::ClientRegistry;
 use crate::session::{spawn_cleanup_task, SessionConfig};
-use crate::state::{stored_mapping_from_json, AppConfig, AppState, ClientRecord};
+use crate::state::{
+    stored_mapping_from_json, AppConfig, AppState, AuthModeKind, ClientRecord, MuxDefaults,
+};
+use anno_common::{DEFAULT_INITIAL_WINDOW, DEFAULT_LANES, DEFAULT_MAX_FRAME_SIZE};
 use clap::Parser;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use socket2::{SockRef, TcpKeepalive};
@@ -68,8 +72,24 @@ struct Args {
     max_control_connections: usize,
 
     /// Maximum concurrent tunnel sessions per client (0 = unlimited).
-    #[arg(long, default_value_t = 0)]
+    /// Defaults to 4096 — high enough for normal traffic, low enough
+    /// to prevent a misbehaving or malicious client from exhausting
+    /// server memory by opening unbounded streams.
+    #[arg(long, default_value_t = 4096)]
     max_sessions_per_client: usize,
+
+    /// Listener actor command-channel capacity. `0` keeps the
+    /// internal default (256). Increase if registry-deletion bursts
+    /// noticeably backpressure API calls.
+    #[arg(long, default_value_t = 0)]
+    listener_command_capacity: usize,
+
+    /// Process-wide cap (in bytes) on memory used by mux reassembly
+    /// buffers across every session. `0` disables the global cap and
+    /// only the per-stream cap (`reassembly_inflight_cap`) applies.
+    /// Defaults to 256 MiB.
+    #[arg(long, default_value_t = 256 * 1024 * 1024)]
+    reassembly_global_cap_bytes: usize,
 
     /// Path to the client registry JSON file.
     #[arg(long, default_value = "clients.json")]
@@ -100,6 +120,21 @@ struct Args {
     /// frame to a session mpsc. Slow consumers are forcefully closed.
     #[arg(long, default_value_t = 5)]
     tcp_send_timeout_secs: u64,
+
+    /// Maximum number of physical TCP lanes a single client mux session
+    /// is allowed to negotiate. Default matches `anno_common::DEFAULT_LANES`.
+    #[arg(long, default_value_t = DEFAULT_LANES)]
+    mux_max_lanes: u8,
+
+    /// Server-side ceiling for the negotiated `max_frame_size`.
+    /// Default matches `anno_common::DEFAULT_MAX_FRAME_SIZE` (16 KiB).
+    #[arg(long, default_value_t = DEFAULT_MAX_FRAME_SIZE)]
+    mux_max_frame_size: u16,
+
+    /// Server-side ceiling for the negotiated initial credit window.
+    /// Default matches `anno_common::DEFAULT_INITIAL_WINDOW`.
+    #[arg(long, default_value_t = DEFAULT_INITIAL_WINDOW)]
+    mux_initial_window: u32,
 }
 
 /// Materialise one offline [`ClientRecord`] per registry entry so the
@@ -148,6 +183,15 @@ impl Drop for ConnectionCounterGuard {
     }
 }
 
+fn require_https_url(name: &str, url: &str) -> Result<(), String> {
+    if !url.starts_with("https://") {
+        return Err(format!(
+            "{name} must use https:// (or set OIDC_ALLOW_INSECURE=1 for development)"
+        ));
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     let filter = EnvFilter::try_from_default_env()
@@ -161,9 +205,88 @@ async fn main() {
     let args = Args::parse();
 
     let admin_password_hash = std::env::var("ADMIN_PASSWORD_HASH").ok();
-    if admin_password_hash.is_some() {
-        tracing::info!("admin password authentication enabled");
+    let oidc_issuer = std::env::var("OIDC_ISSUER").ok();
+    let oidc_client_id = std::env::var("OIDC_CLIENT_ID").ok();
+    let oidc_client_secret = std::env::var("OIDC_CLIENT_SECRET").ok();
+    let oidc_redirect_uri = std::env::var("OIDC_REDIRECT_URI").ok();
+    let oidc_allow_insecure = std::env::var("OIDC_ALLOW_INSECURE").ok().as_deref() == Some("1");
+
+    let oidc_set_count = [
+        oidc_issuer.as_ref(),
+        oidc_client_id.as_ref(),
+        oidc_client_secret.as_ref(),
+        oidc_redirect_uri.as_ref(),
+    ]
+    .iter()
+    .filter(|o| o.is_some())
+    .count();
+
+    if oidc_set_count != 0 && oidc_set_count != 4 {
+        if oidc_issuer.is_none() {
+            tracing::warn!("OIDC partially configured: OIDC_ISSUER is not set; OIDC disabled");
+        }
+        if oidc_client_id.is_none() {
+            tracing::warn!("OIDC partially configured: OIDC_CLIENT_ID is not set; OIDC disabled");
+        }
+        if oidc_client_secret.is_none() {
+            tracing::warn!(
+                "OIDC partially configured: OIDC_CLIENT_SECRET is not set; OIDC disabled"
+            );
+        }
+        if oidc_redirect_uri.is_none() {
+            tracing::warn!("OIDC partially configured: OIDC_REDIRECT_URI is not set; OIDC disabled");
+        }
     }
+
+    if admin_password_hash.is_some() && oidc_set_count == 4 {
+        tracing::error!(
+            "FATAL: ADMIN_PASSWORD_HASH and full OIDC configuration cannot both be set; choose one"
+        );
+        std::process::exit(1);
+    }
+
+    let oidc_ready = oidc_set_count == 4;
+    if oidc_ready {
+        let issuer = oidc_issuer.as_ref().expect("issuer");
+        let redirect = oidc_redirect_uri.as_ref().expect("redirect");
+        if !oidc_allow_insecure {
+            for (name, url) in [("OIDC_ISSUER", issuer.as_str()), ("OIDC_REDIRECT_URI", redirect)] {
+                if let Err(msg) = require_https_url(name, url) {
+                    tracing::error!("FATAL: {msg}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
+    let (auth_mode, admin_password_hash, oidc_state) = if admin_password_hash.is_some() {
+        tracing::info!("admin password authentication enabled");
+        (
+            AuthModeKind::Password,
+            admin_password_hash,
+            None::<Arc<crate::oidc::OidcState>>,
+        )
+    } else if oidc_ready {
+        let issuer = oidc_issuer.expect("issuer");
+        let client_id = oidc_client_id.expect("client_id");
+        let client_secret = oidc_client_secret.expect("client_secret");
+        let redirect_uri = oidc_redirect_uri.expect("redirect_uri");
+        let oidc = crate::oidc::OidcState::discover_and_connect(
+            issuer,
+            client_id,
+            client_secret,
+            redirect_uri,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("FATAL: OIDC discovery / client init failed: {}", e);
+            std::process::exit(1);
+        });
+        tracing::info!("OIDC SSO authentication enabled");
+        (AuthModeKind::Oidc, None, Some(oidc))
+    } else {
+        (AuthModeKind::None, None, None)
+    };
 
     let metrics_token = std::env::var("METRICS_TOKEN").ok().filter(|s| !s.is_empty());
     if metrics_token.is_some() && args.metrics_listen.is_none() {
@@ -188,6 +311,19 @@ async fn main() {
         register_timeout: Duration::from_secs(args.register_timeout_secs),
         public_bind: args.public_bind,
         control_addr: args.control,
+        mux: MuxDefaults {
+            max_lanes: args.mux_max_lanes,
+            max_frame_size: args.mux_max_frame_size,
+            initial_window: args.mux_initial_window,
+            ..MuxDefaults::default()
+        },
+        auth_mode,
+        listener_command_capacity: if args.listener_command_capacity == 0 {
+            None
+        } else {
+            Some(args.listener_command_capacity)
+        },
+        reassembly_global_cap: args.reassembly_global_cap_bytes,
     };
 
     let registry = ClientRegistry::load(&args.registry_file);
@@ -212,9 +348,10 @@ async fn main() {
     // Construct the listener handle before the state so state can hold it.
     // The actor itself is spawned after state is built, since it needs a
     // state clone to look up mappings during reconciliation.
-    let (listener_handle, listener_rx) = make_handle();
+    let (listener_handle, listener_rx) =
+        make_handle_with_capacity(config.listener_command_capacity);
 
-    let state = AppState::with_config_and_registry(config, registry, listener_handle);
+    let state = AppState::with_config_and_registry(config, oidc_state, registry, listener_handle);
 
     preload_registry_records(&state);
 
